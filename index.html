@@ -17,7 +17,7 @@
      ・圧縮: pako (zlib実装) 。JPEG化した映像データ及び任意データをDEFLATE圧縮しQRコード数を削減する。
 -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/qrcode.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -216,6 +216,16 @@
 
       <div class="card">
         <h2><span class="bar"></span>送信（圧縮）設定</h2>
+        <div class="row2" style="margin-bottom:12px;">
+          <div class="checkline" style="margin-bottom:0;">
+            <input type="checkbox" id="tx-video-enabled" checked>
+            <label for="tx-video-enabled">映像を送信</label>
+          </div>
+          <div class="checkline" style="margin-bottom:0;">
+            <input type="checkbox" id="tx-audio-enabled" checked>
+            <label for="tx-audio-enabled">音声を送信</label>
+          </div>
+        </div>
         <label class="field"><span class="lbl">送信映像画質</span>
           <select id="tx-vid-quality"></select>
         </label>
@@ -582,6 +592,8 @@ function txSettings(){
     ver: parseInt($('tx-qr-ver').value,10),
     qrFps: parseInt($('tx-qr-fps').value,10),
     useAudio: $('tx-use-audio').checked,
+    videoOn: $('tx-video-enabled').checked,
+    audioOn: $('tx-audio-enabled').checked,
   };
 }
 
@@ -619,7 +631,7 @@ async function txStart(){
   const scheduleFrame = ()=>{
     if (!TX.active) return;
     const cur = txSettings();
-    txCaptureAndCompress(cur);
+    if (cur.videoOn) txCaptureAndCompress(cur);
     TX.frameTimer = setTimeout(scheduleFrame, Math.max(1000/cur.vidFps, 10));
   };
   scheduleFrame();
@@ -694,16 +706,18 @@ function txStartAudio(s){
   }
   TX.recorder.ondataavailable = async (ev)=>{
     if (!TX.active || !ev.data || ev.data.size===0) return;
+    const curS = txSettings();
+    if (!curS.audioOn) return; // ミュート中は破棄
     const buf = await ev.data.arrayBuffer();
     const bytes = new Uint8Array(buf);
-    const curS = txSettings();
     const audioId = (TX.audioSeq++) >>> 0;
     const chunks = packetizeFrame(PKT_TYPE_AUDIO, audioId, bytes, curS.ver, curS.ec);
     TX.outQueue.push({chunks, size:bytes.length, isAudio:true});
     while (TX.outQueue.length > 3){ TX.outQueue.shift(); }
   };
   TX.recorder.start(timeslice);
-  $('s-audio').textContent = (s.audQ.bps/1000)+'kbps / '+timeslice.toFixed(0)+'ms';
+  if (!s.audioOn) TX.recorder.pause();
+  $('s-audio').textContent = (s.audQ.bps/1000)+'kbps / '+timeslice.toFixed(0)+'ms'+(s.audioOn?'':' (ミュート)');
 }
 
 function txAdvanceQr(s){
@@ -1024,6 +1038,21 @@ function initUI(){
     $('tab-btn-tx').classList.remove('active','tx-active');
     $('view-rx').classList.add('active');
     $('view-tx').classList.remove('active');
+  });
+
+  $('tx-audio-enabled').addEventListener('change', ()=>{
+    const on = $('tx-audio-enabled').checked;
+    if (TX.recorder && TX.recorder.state !== 'inactive'){
+      if (on && TX.recorder.state === 'paused') TX.recorder.resume();
+      if (!on && TX.recorder.state === 'recording') TX.recorder.pause();
+    }
+    $('s-audio').textContent = on ? '再開' : 'ミュート中';
+  });
+  $('tx-use-audio').addEventListener('change', ()=>{
+    const on = $('tx-use-audio').checked;
+    $('tx-mic-device').disabled = !on;
+    $('tx-audio-enabled').disabled = !on;
+    if (!on) $('tx-audio-enabled').checked = false;
   });
 
   $('tx-start').addEventListener('click', txStart);
