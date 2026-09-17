@@ -5,20 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Live-QR-streaming</title>
 
-<!-- ライブラリ選定について:
-     ・QRエンコード: qrcode-generator (kazuhikoarase, npm "qrcode-generator" 本体の qrcode.js のみを読み込む)
-       => addData() は既定で 8bit Byte モード固定・charCodeAt(i)&0xff をそのまま1バイトとして書き込むだけの
-          「素の」実装で、UTF-8への再エンコードや余計な変換を一切行わない。UTF8拡張ファイル(qrcode_UTF8.js)は
-          あえて読み込まない。これにより任意のバイナリ列を1バイト=1文字として欠落なく埋め込め、かつ
-          バージョン(1-40)・誤り訂正レベルを直接指定できるため、本アプリの要件に最も適する。
-     ・QRデコード: jsQR (cozmo/jsQR) 純JS実装。decode結果の binaryData がバイト列そのもの
-          (文字コード変換なし)なので上記エンコーダと対になる。WASM版(zxing-wasm等)は理論上高速だが
-          読み込み・初期化コストや環境依存が大きいため、単一HTMLで即動作する軽量さと実績を優先しこちらを採用。
-     ・圧縮: pako (zlib実装) 。JPEG化した映像データ及び任意データをDEFLATE圧縮しQRコード数を削減する。
+<!-- ライブラリ選定について（decimen-optical-transfer と同系統の構成に変更）:
+     ・QRエンコード: node-qrcode (soldair/node-qrcode, npm "qrcode" のプリコンパイル済みブラウザ版 build/qrcode.js)
+       => decimen-optical-transfer が生成側に採用しているのと同じライブラリ。QRCode.create() は
+          mode:'byte' セグメントに Uint8Array 由来の配列をそのまま渡せるため、文字列変換(charCode変換)の
+          オーバーヘッドなしにバイナリを直接エンコードできる。バージョン(1-40)・誤り訂正レベルも直接指定可能。
+     ・QRデコード: zxing-wasm (Sec-ant/zxing-wasm)。decimen-optical-transfer の読み取り側
+          (decimen-codec = 自前ビルドの zxing-cpp/WASM) と同じ zxing-cpp を WebAssembly化した公開パッケージ。
+          純JS実装のjsQRより大幅に高速・頑健なため、これに切り替えた。ReadResult.bytes が
+          生バイト列そのもの(文字コード変換なし)なので上記エンコーダと正しく対になる。
+          ファイルサイズは増える(wasmバイナリ約1MB)が、速度優先のため許容する。
+     ・圧縮: 映像フレームはJPEG化した時点で既に十分圧縮されており、その上からdeflateを掛けても
+          縮みがわずかな割にCPUコストが大きいため、パイプライン高速化のためdeflate/inflateの
+          往復を撤廃し、JPEGバイト列をそのままQRパケット化する。
 -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.1/dist/iife/reader/index.js"></script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -417,28 +419,17 @@ function formatKBs(bytesPerSec){
   return (bytesPerSec/1024).toFixed(1)+' KB/s';
 }
 
-// Uint8Array(0-255) -> "生バイト文字列"（charCodeAt が 1バイトになるよう変換）
-function bytesToBinaryString(bytes){
-  let s = '';
-  const CHUNK = 0x2000;
-  for (let i=0;i<bytes.length;i+=CHUNK){
-    s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+CHUNK, bytes.length)));
-  }
-  return s;
-}
-
 /* ============================================================
    QRコード 1個あたりの最大バイト数を実測（バージョン×EC でキャッシュ）
-   qrcode-generator は 8bit Byte 固定・生バイトそのまま書き込みのため
-   中身の値に依らず「長さ」だけで容量が決まる。二分探索で実測する。
+   node-qrcode は byteモードのセグメントに配列/Uint8ClampedArrayを直接渡せるため
+   文字列変換なしでそのまま実測できる。中身の値に依らず「長さ」だけで容量が決まる
+   ため、二分探索で実測する。
    ============================================================ */
 const capacityCache = new Map();
 function probeFits(version, ec, byteLen){
   try{
-    const qr = qrcode(version, ec);
-    const dummy = byteLen>0 ? new Array(byteLen+1).join('\u0000') : '';
-    qr.addData(dummy);
-    qr.make();
+    const dummy = byteLen>0 ? new Array(byteLen).fill(0) : [];
+    QRCode.create([{ data: dummy, mode:'byte' }], { version: version, errorCorrectionLevel: ec });
     return true;
   }catch(e){
     return false;
@@ -502,8 +493,8 @@ const qrSmallCanvas = document.createElement('canvas');
 const qrSmallCtx = qrSmallCanvas.getContext('2d');
 const QUIET = 4; // 静寂領域(モジュール数)
 
-function renderQr(qr, targetCanvas){
-  const n = qr.getModuleCount();
+function renderQr(matrix, targetCanvas){
+  const n = matrix.size;
   const full = n + QUIET*2;
   if (qrSmallCanvas.width !== full){
     qrSmallCanvas.width = full;
@@ -514,7 +505,7 @@ function renderQr(qr, targetCanvas){
   data.fill(255); // 白で初期化(アルファ含む255で全部埋まる)
   for (let r=0;r<n;r++){
     for (let c=0;c<n;c++){
-      if (qr.isDark(r,c)){
+      if (matrix.get(r,c)){
         const px = c+QUIET, py = r+QUIET;
         const idx = (py*full+px)*4;
         data[idx]=0; data[idx+1]=0; data[idx+2]=0; data[idx+3]=255;
@@ -674,13 +665,9 @@ function txCaptureAndCompress(s){
     if (!blob || !TX.active) return;
     const buf = await blob.arrayBuffer();
     const raw = new Uint8Array(buf);
-    let compressed;
-    try{
-      compressed = pako.deflateRaw(raw, {level:6});
-    }catch(e){ compressed = raw; }
     const frameId = (TX.frameSeq++) >>> 0;
-    const chunks = packetizeFrame(PKT_TYPE_VIDEO, frameId, compressed, s.ver, s.ec);
-    TX.outQueue.push({chunks, size:compressed.length});
+    const chunks = packetizeFrame(PKT_TYPE_VIDEO, frameId, raw, s.ver, s.ec);
+    TX.outQueue.push({chunks, size:raw.length});
     // 遅延が溜まりすぎないよう、古いフレームを間引く
     while (TX.outQueue.length > 2){
       TX.outQueue.shift();
@@ -728,10 +715,8 @@ function txAdvanceQr(s){
   }
   const pkt = TX.curFrame.chunks[TX.curIdx];
   try{
-    const qr = qrcode(s.ver, s.ec);
-    qr.addData(bytesToBinaryString(pkt));
-    qr.make();
-    renderQr(qr, $('tx-qr-canvas'));
+    const created = QRCode.create([{ data: Array.from(pkt), mode:'byte' }], { version: s.ver, errorCorrectionLevel: s.ec });
+    renderQr(created.modules, $('tx-qr-canvas'));
   }catch(e){
     logTo('tx-log', 'QR生成エラー（バージョン/EC設定を見直してください）: '+e.message, 'err');
     TX.curFrame = null; TX.curIdx = 0;
@@ -783,6 +768,7 @@ const RX = {
   stream:null,
   scanCanvas: document.createElement('canvas'),
   rafHandle:null,
+  decoding:false,
   videoBuffers: new Map(), // frameId -> {total, chunks:Array, count}
   lastShownVideoId: -1,
   completedFrames:0,
@@ -794,6 +780,8 @@ const RX = {
   audioQueue:[],
   audioChunkCount:0,
 };
+
+const RX_READ_OPTS = { tryHarder:false, formats:['QRCode'], maxNumberOfSymbols:1 };
 
 function rxSettings(){
   return {
@@ -820,6 +808,7 @@ async function rxStart(){
   }
   $('rx-scan-video').srcObject = RX.stream;
   RX.active = true;
+  RX.decoding = false;
   RX.videoBuffers.clear();
   RX.audioBuffers = new Map();
   RX.lastShownVideoId = -1;
@@ -832,6 +821,17 @@ async function rxStart(){
   $('rx-stop').disabled = false;
   logTo('rx-log', '受信を開始しました', 'ok');
 
+  if (window.ZXingWASM && ZXingWASM.prepareZXingModule){
+    logTo('rx-log', 'デコードエンジン(zxing-wasm / zxing-cpp)を初期化中…');
+    ZXingWASM.prepareZXingModule({ fireImmediately:true }).then(()=>{
+      logTo('rx-log', 'デコードエンジンの準備ができました', 'ok');
+    }).catch((e)=>{
+      logTo('rx-log', 'デコードエンジンの初期化エラー: '+e.message, 'err');
+    });
+  } else {
+    logTo('rx-log', 'zxing-wasm が読み込まれていません(CDNブロック等)。受信できません。', 'err');
+  }
+
   rxSetupAudioSink();
 
   RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
@@ -840,7 +840,7 @@ async function rxStart(){
 function rxDecodeLoop(){
   if (!RX.active) return;
   const video = $('rx-scan-video');
-  if (video.readyState >= 2 && video.videoWidth){
+  if (video.readyState >= 2 && video.videoWidth && !RX.decoding && window.ZXingWASM){
     const w = video.videoWidth, h = video.videoHeight;
     const cv = RX.scanCanvas;
     if (cv.width !== w) cv.width = w;
@@ -848,14 +848,16 @@ function rxDecodeLoop(){
     const ctx = cv.getContext('2d', { willReadFrequently:true });
     ctx.drawImage(video, 0, 0, w, h);
     const imgData = ctx.getImageData(0, 0, w, h);
-    let code = null;
-    try{
-      code = jsQR(imgData.data, w, h, { inversionAttempts:'dontInvert' });
-    }catch(e){ /* ignore single-frame decode failure */ }
-    if (code && code.binaryData && code.binaryData.length >= HEADER_SIZE){
-      rxHandlePacket(new Uint8Array(code.binaryData));
-      RX.qrCount++;
-    }
+    RX.decoding = true;
+    ZXingWASM.readBarcodes(imgData, RX_READ_OPTS).then((results)=>{
+      RX.decoding = false;
+      if (results && results.length && results[0].bytes && results[0].bytes.length >= HEADER_SIZE){
+        rxHandlePacket(new Uint8Array(results[0].bytes));
+        RX.qrCount++;
+      }
+    }).catch(()=>{
+      RX.decoding = false; // 単発のデコード失敗は無視して次のフレームへ
+    });
   }
   const t = nowMs();
   if (t - RX.qrWindowStart >= 500){
