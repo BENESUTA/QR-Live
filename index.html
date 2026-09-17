@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live-QR-streaming</title>
+
+<!-- ライブラリ選定について:
+     ・QRエンコード: qrcode-generator (kazuhikoarase, npm "qrcode-generator" 本体の qrcode.js のみを読み込む)
+       => addData() は既定で 8bit Byte モード固定・charCodeAt(i)&0xff をそのまま1バイトとして書き込むだけの
+          「素の」実装で、UTF-8への再エンコードや余計な変換を一切行わない。UTF8拡張ファイル(qrcode_UTF8.js)は
+          あえて読み込まない。これにより任意のバイナリ列を1バイト=1文字として欠落なく埋め込め、かつ
+          バージョン(1-40)・誤り訂正レベルを直接指定できるため、本アプリの要件に最も適する。
+     ・QRデコード: jsQR (cozmo/jsQR) 純JS実装。decode結果の binaryData がバイト列そのもの
+          (文字コード変換なし)なので上記エンコーダと対になる。WASM版(zxing-wasm等)は理論上高速だが
+          読み込み・初期化コストや環境依存が大きいため、単一HTMLで即動作する軽量さと実績を優先しこちらを採用。
+     ・圧縮: pako (zlib実装) 。JPEG化した映像データ及び任意データをDEFLATE圧縮しQRコード数を削減する。
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --bg: #10151b;
+    --panel: #171f27;
+    --panel-2: #1d2731;
+    --line: #2a3644;
+    --ink: #e7edf3;
+    --ink-dim: #8fa1b3;
+    --tx: #ffb020;
+    --tx-dim: #7a5a1e;
+    --rx: #45d8d8;
+    --rx-dim: #276a6a;
+    --bad: #ff5d5d;
+    --good: #57d97a;
+    --radius: 3px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      linear-gradient(var(--line) 1px, transparent 1px) 0 0/100% 28px,
+      var(--bg);
+    color:var(--ink);
+    font-family:'Space Grotesk',system-ui,sans-serif;
+    min-height:100vh;
+  }
+  ::selection{ background:var(--tx); color:#12161c; }
+
+  header.top{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:18px 22px; border-bottom:1px solid var(--line);
+    flex-wrap:wrap; gap:12px;
+  }
+  .brand{ display:flex; align-items:baseline; gap:10px; }
+  .brand .dot{
+    width:10px;height:10px;border-radius:50%;
+    background:var(--tx);
+    box-shadow:0 0 10px 2px var(--tx);
+  }
+  .brand h1{ font-size:20px; margin:0; letter-spacing:.02em; font-weight:700; }
+  .brand small{ color:var(--ink-dim); font-family:'JetBrains Mono',monospace; font-size:11px; }
+
+  .switcher{
+    display:flex; border:1px solid var(--line); border-radius:var(--radius); overflow:hidden;
+    font-family:'JetBrains Mono',monospace; font-size:13px;
+  }
+  .switcher button{
+    background:transparent; border:0; color:var(--ink-dim); padding:9px 20px; cursor:pointer;
+    letter-spacing:.06em;
+  }
+  .switcher button.active.tx-active{ background:var(--tx); color:#181103; font-weight:700; }
+  .switcher button.active.rx-active{ background:var(--rx); color:#04191a; font-weight:700; }
+
+  main{ padding:20px 22px 60px; max-width:1400px; margin:0 auto; }
+  .panel-view{ display:none; }
+  .panel-view.active{ display:grid; grid-template-columns: 360px 1fr; gap:18px; align-items:start; }
+  @media (max-width: 920px){ .panel-view.active{ grid-template-columns: 1fr; } }
+
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:16px 16px 18px;
+  }
+  .card + .card{ margin-top:14px; }
+  .card h2{
+    margin:0 0 12px; font-size:12px; letter-spacing:.08em; color:var(--ink-dim);
+    display:flex; align-items:center; gap:8px; font-weight:600;
+  }
+  .card h2 .bar{ width:14px; height:2px; background:currentColor; }
+
+  label.field{ display:block; margin-bottom:12px; }
+  label.field .lbl{
+    display:flex; justify-content:space-between; font-size:12.5px; color:var(--ink-dim);
+    margin-bottom:5px; font-family:'JetBrains Mono',monospace;
+  }
+  label.field .lbl b{ color:var(--ink); font-weight:600; }
+  select, input[type=range]{ width:100%; }
+  select{
+    background:var(--panel-2); color:var(--ink); border:1px solid var(--line);
+    border-radius:var(--radius); padding:7px 8px; font-family:'Space Grotesk',sans-serif; font-size:13px;
+  }
+  input[type=range]{
+    -webkit-appearance:none; height:3px; background:var(--line); border-radius:2px; outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; width:14px; height:14px; border-radius:50%;
+    background:var(--tx); cursor:pointer; border:2px solid #0e0b04;
+  }
+  .rx-scope input[type=range]::-webkit-slider-thumb{ background:var(--rx); border-color:#03181a; }
+  .row2{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .checkline{ display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-dim); margin-bottom:10px; }
+
+  .btnrow{ display:flex; gap:8px; margin-top:4px; }
+  button.action{
+    flex:1; padding:11px 10px; border-radius:var(--radius); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--ink); font-family:'JetBrains Mono',monospace;
+    font-size:12.5px; letter-spacing:.05em; cursor:pointer;
+  }
+  button.action.go.tx{ background:var(--tx); border-color:var(--tx); color:#181103; font-weight:700; }
+  button.action.go.rx{ background:var(--rx); border-color:var(--rx); color:#04191a; font-weight:700; }
+  button.action:disabled{ opacity:.35; cursor:not-allowed; }
+  button.action.stop{ color:var(--bad); border-color:var(--bad); }
+
+  .stagegrid{ display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+  @media (max-width: 1180px){ .stagegrid{ grid-template-columns: 1fr; } }
+
+  .videobox{
+    background:#000; border:1px solid var(--line); border-radius:var(--radius);
+    aspect-ratio:4/3; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative;
+  }
+  .videobox video, .videobox img{ width:100%; height:100%; object-fit:contain; }
+  .videobox .tag{
+    position:absolute; top:8px; left:8px; font-family:'JetBrains Mono',monospace; font-size:10.5px;
+    padding:3px 7px; border-radius:2px; background:rgba(0,0,0,.55); color:var(--ink-dim); letter-spacing:.06em;
+  }
+  .qrbox{
+    background:#fff; border-radius:var(--radius); display:flex; align-items:center; justify-content:center;
+    aspect-ratio:1/1; overflow:hidden; border:1px solid var(--line);
+  }
+  .qrbox canvas{ width:100%; height:100%; image-rendering:pixelated; }
+
+  .statline{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-top:12px;
+    font-family:'JetBrains Mono',monospace;
+  }
+  .stat{ background:var(--panel-2); border:1px solid var(--line); border-radius:var(--radius); padding:9px 10px; }
+  .stat .k{ font-size:10px; color:var(--ink-dim); letter-spacing:.06em; }
+  .stat .v{ font-size:15px; margin-top:2px; }
+  .tx-scope .stat .v{ color:var(--tx); }
+  .rx-scope .stat .v{ color:var(--rx); }
+
+  .progresswrap{ margin-top:10px; height:6px; background:var(--panel-2); border-radius:3px; overflow:hidden; border:1px solid var(--line); }
+  .progresswrap .bar{ height:100%; width:0%; background:var(--tx); transition:width .08s linear; }
+  .rx-scope .progresswrap .bar{ background:var(--rx); }
+
+  .loglist{
+    margin-top:10px; height:120px; overflow-y:auto; font-family:'JetBrains Mono',monospace; font-size:11.5px;
+    background:#0b1015; border:1px solid var(--line); border-radius:var(--radius); padding:8px;
+    color:var(--ink-dim);
+  }
+  .loglist div{ white-space:pre-wrap; word-break:break-all; margin-bottom:2px; }
+  .loglist div.err{ color:var(--bad); }
+  .loglist div.ok{ color:var(--good); }
+
+  .hint{ font-size:11.5px; color:var(--ink-dim); line-height:1.6; margin-top:6px; }
+  .capline{ font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--ink-dim); margin-top:2px; }
+  .capline b{ color:var(--ink); }
+
+  audio{ width:100%; margin-top:10px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>Live-QR-streaming</h1>
+    <small>optical packet video/audio transfer</small>
+  </div>
+  <div class="switcher">
+    <button id="tab-btn-tx" class="active tx-active">送信側 · TX</button>
+    <button id="tab-btn-rx">受信側 · RX</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============================= 送信側 ============================= -->
+  <section id="view-tx" class="panel-view active tx-scope">
+    <div class="colsettings">
+
+      <div class="card">
+        <h2><span class="bar"></span>カメラ映像取得設定</h2>
+        <label class="field"><span class="lbl">カメラデバイス</span>
+          <select id="tx-cam-device"><option value="">既定のカメラ</option></select>
+        </label>
+        <label class="field"><span class="lbl">取得画質</span>
+          <select id="tx-cam-res"></select>
+        </label>
+        <label class="field"><span class="lbl">取得フレームレート <b id="tx-cam-fps-v">30</b> fps</span>
+          <input type="range" id="tx-cam-fps" min="1" max="60" value="30" step="1">
+        </label>
+        <div class="checkline">
+          <input type="checkbox" id="tx-use-audio" checked>
+          <label for="tx-use-audio">マイク音声も取得する</label>
+        </div>
+        <label class="field"><span class="lbl">マイクデバイス</span>
+          <select id="tx-mic-device"><option value="">既定のマイク</option></select>
+        </label>
+      </div>
+
+      <div class="card">
+        <h2><span class="bar"></span>送信（圧縮）設定</h2>
+        <label class="field"><span class="lbl">送信映像画質</span>
+          <select id="tx-vid-quality"></select>
+        </label>
+        <label class="field"><span class="lbl">送信フレームレート <b id="tx-vid-fps-v">8</b> fps</span>
+          <input type="range" id="tx-vid-fps" min="1" max="30" value="8" step="1">
+        </label>
+        <label class="field"><span class="lbl">音声品質</span>
+          <select id="tx-aud-quality"></select>
+        </label>
+        <label class="field"><span class="lbl">音声送信頻度 <b id="tx-aud-rate-v">4</b> 回/秒</span>
+          <input type="range" id="tx-aud-rate" min="1" max="10" value="4" step="1">
+        </label>
+      </div>
+
+      <div class="card">
+        <h2><span class="bar"></span>QRコード設定</h2>
+        <label class="field"><span class="lbl">復元率（誤り訂正レベル）</span>
+          <select id="tx-qr-ec"></select>
+        </label>
+        <label class="field"><span class="lbl">QRコードバージョン <b id="tx-qr-ver-v">10</b> (1-40)</span>
+          <input type="range" id="tx-qr-ver" min="1" max="40" value="10" step="1">
+        </label>
+        <label class="field"><span class="lbl">QRコード切替速度 <b id="tx-qr-fps-v">15</b> fps (1-60)</span>
+          <input type="range" id="tx-qr-fps" min="1" max="60" value="15" step="1">
+        </label>
+        <div class="capline">1コード最大データ量: <b id="tx-cap-v">-</b> バイト（9バイトのヘッダ込み）</div>
+        <div class="hint">バージョン・EC・切替速度を上げるほど転送量は増えますが、生成負荷も上がり実機のfpsが目標値に届かないことがあります。受信側のカメラ性能に合わせて調整してください。</div>
+      </div>
+
+      <div class="btnrow">
+        <button class="action go tx" id="tx-start">送信開始</button>
+        <button class="action stop" id="tx-stop" disabled>停止</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="stagegrid">
+        <div>
+          <div class="videobox"><span class="tag">カメラプレビュー</span><video id="tx-preview" autoplay muted playsinline></video></div>
+        </div>
+        <div>
+          <div class="qrbox"><canvas id="tx-qr-canvas"></canvas></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="bar"></span>送信ステータス</h2>
+        <div class="statline">
+          <div class="stat"><div class="k">映像フレームID</div><div class="v" id="s-frame-id">0</div></div>
+          <div class="stat"><div class="k">チャンク進捗</div><div class="v" id="s-chunk">0 / 0</div></div>
+          <div class="stat"><div class="k">実測QR速度</div><div class="v" id="s-qr-fps">0.0 fps</div></div>
+          <div class="stat"><div class="k">送出キュー</div><div class="v" id="s-queue">0 フレーム</div></div>
+          <div class="stat"><div class="k">推定送出速度</div><div class="v" id="s-bps">0 KB/s</div></div>
+          <div class="stat"><div class="k">音声</div><div class="v" id="s-audio">-</div></div>
+        </div>
+        <div class="progresswrap"><div class="bar" id="s-progressbar"></div></div>
+        <div class="loglist" id="tx-log"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================= 受信側 ============================= -->
+  <section id="view-rx" class="panel-view rx-scope">
+    <div class="colsettings">
+
+      <div class="card">
+        <h2><span class="bar"></span>カメラ映像取得設定（読取用）</h2>
+        <label class="field"><span class="lbl">カメラデバイス</span>
+          <select id="rx-cam-device"><option value="">既定のカメラ</option></select>
+        </label>
+        <label class="field"><span class="lbl">取得画質</span>
+          <select id="rx-cam-res"></select>
+        </label>
+        <label class="field"><span class="lbl">取得フレームレート <b id="rx-cam-fps-v">30</b> fps</span>
+          <input type="range" id="rx-cam-fps" min="1" max="60" value="30" step="1">
+        </label>
+        <div class="hint">送信側のQRコードが画面いっぱいに、なるべく正対して映るようにカメラを固定してください。取得解像度を上げると認識精度は上がりますが、デコード負荷も上がります。</div>
+      </div>
+
+      <div class="btnrow">
+        <button class="action go rx" id="rx-start">受信開始</button>
+        <button class="action stop" id="rx-stop" disabled>停止</button>
+      </div>
+
+      <div class="card">
+        <h2><span class="bar"></span>復元音声</h2>
+        <audio id="rx-audio" controls></audio>
+        <div class="hint" id="rx-audio-hint">未接続</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="stagegrid">
+        <div>
+          <div class="videobox"><span class="tag">読取カメラ</span><video id="rx-scan-video" autoplay muted playsinline></video></div>
+        </div>
+        <div>
+          <div class="videobox"><span class="tag">復元映像</span><img id="rx-recon-img" alt="受信待機中"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="bar"></span>受信ステータス</h2>
+        <div class="statline">
+          <div class="stat"><div class="k">QR読取速度</div><div class="v" id="r-qr-fps">0.0 fps</div></div>
+          <div class="stat"><div class="k">完成フレーム数</div><div class="v" id="r-frames">0</div></div>
+          <div class="stat"><div class="k">現フレーム進捗</div><div class="v" id="r-progress">- / -</div></div>
+          <div class="stat"><div class="k">受信速度</div><div class="v" id="r-bps">0 KB/s</div></div>
+          <div class="stat"><div class="k">保留中フレーム</div><div class="v" id="r-pending">0</div></div>
+          <div class="stat"><div class="k">音声チャンク</div><div class="v" id="r-audio-chunks">0</div></div>
+        </div>
+        <div class="progresswrap"><div class="bar" id="r-progressbar"></div></div>
+        <div class="loglist" id="rx-log"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+'use strict';
+
+/* ============================================================
+   共通定数 / プリセット
+   ============================================================ */
+const HEADER_SIZE = 9; // type(1) + frameId(4) + chunkIndex(2) + totalChunks(2)
+const PKT_TYPE_VIDEO = 1;
+const PKT_TYPE_AUDIO = 2;
+
+const CAM_RES_PRESETS = [
+  { label:'176×144（QCIF・低負荷）', w:176,  h:144  },
+  { label:'320×240（QVGA）',         w:320,  h:240  },
+  { label:'640×480（VGA）',          w:640,  h:480, def:true },
+  { label:'1280×720（HD）',          w:1280, h:720  },
+  { label:'1920×1080（Full HD）',    w:1920, h:1080 },
+];
+
+const TX_QUALITY_PRESETS = [
+  { label:'低画質（160×120 / Q0.40）', w:160, h:120, q:0.40 },
+  { label:'中画質（320×240 / Q0.50）', w:320, h:240, q:0.50, def:true },
+  { label:'高画質（480×360 / Q0.60）', w:480, h:360, q:0.60 },
+  { label:'最高画質（640×480 / Q0.75）',w:640, h:480, q:0.75 },
+];
+
+const AUDIO_QUALITY_PRESETS = [
+  { label:'低音質（12kbps）', bps:12000 },
+  { label:'中音質（24kbps）', bps:24000, def:true },
+  { label:'高音質（48kbps）', bps:48000 },
+  { label:'最高音質（96kbps）', bps:96000 },
+];
+
+const EC_LEVELS = [
+  { value:'L', label:'L（約7%復元・最大容量）' },
+  { value:'M', label:'M（約15%復元）', def:true },
+  { value:'Q', label:'Q（約25%復元）' },
+  { value:'H', label:'H（約30%復元・最頑健）' },
+];
+
+/* ============================================================
+   ユーティリティ
+   ============================================================ */
+function $(id){ return document.getElementById(id); }
+
+function nowMs(){ return performance.now(); }
+
+function fillSelect(sel, presets, fmt){
+  presets.forEach((p, i)=>{
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = fmt ? fmt(p) : p.label;
+    if (p.def) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+function logTo(panelId, msg, cls){
+  const el = $(panelId);
+  const line = document.createElement('div');
+  const t = new Date();
+  const ts = String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0');
+  line.textContent = '['+ts+'] '+msg;
+  if (cls) line.className = cls;
+  el.appendChild(line);
+  while (el.childNodes.length > 200) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+
+function formatKBs(bytesPerSec){
+  return (bytesPerSec/1024).toFixed(1)+' KB/s';
+}
+
+// Uint8Array(0-255) -> "生バイト文字列"（charCodeAt が 1バイトになるよう変換）
+function bytesToBinaryString(bytes){
+  let s = '';
+  const CHUNK = 0x2000;
+  for (let i=0;i<bytes.length;i+=CHUNK){
+    s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+CHUNK, bytes.length)));
+  }
+  return s;
+}
+
+/* ============================================================
+   QRコード 1個あたりの最大バイト数を実測（バージョン×EC でキャッシュ）
+   qrcode-generator は 8bit Byte 固定・生バイトそのまま書き込みのため
+   中身の値に依らず「長さ」だけで容量が決まる。二分探索で実測する。
+   ============================================================ */
+const capacityCache = new Map();
+function probeFits(version, ec, byteLen){
+  try{
+    const qr = qrcode(version, ec);
+    const dummy = byteLen>0 ? new Array(byteLen+1).join('\u0000') : '';
+    qr.addData(dummy);
+    qr.make();
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+function getQrCapacity(version, ec){
+  const key = version+'-'+ec;
+  if (capacityCache.has(key)) return capacityCache.get(key);
+  let lo=0, hi=3000, best=0;
+  while(lo<=hi){
+    const mid=(lo+hi)>>1;
+    if (probeFits(version, ec, mid)){ best=mid; lo=mid+1; } else { hi=mid-1; }
+  }
+  capacityCache.set(key, best);
+  return best;
+}
+
+/* ============================================================
+   パケット化 / 復元
+   ============================================================ */
+function buildPacket(type, frameId, chunkIndex, totalChunks, payload){
+  const pkt = new Uint8Array(HEADER_SIZE + payload.length);
+  const dv = new DataView(pkt.buffer);
+  dv.setUint8(0, type);
+  dv.setUint32(1, frameId >>> 0);
+  dv.setUint16(5, chunkIndex);
+  dv.setUint16(7, totalChunks);
+  pkt.set(payload, HEADER_SIZE);
+  return pkt;
+}
+
+function packetizeFrame(type, frameId, payloadBytes, version, ec){
+  const cap = Math.max(getQrCapacity(version, ec) - HEADER_SIZE, 1);
+  const total = Math.max(1, Math.ceil(payloadBytes.length / cap));
+  const chunks = [];
+  for (let i=0;i<total;i++){
+    const start = i*cap;
+    const slice = payloadBytes.subarray(start, Math.min(start+cap, payloadBytes.length));
+    chunks.push(buildPacket(type, frameId, i, total, slice));
+  }
+  return chunks;
+}
+
+function parsePacket(bytes){
+  // bytes: Uint8Array/Uint8ClampedArray
+  if (bytes.length < HEADER_SIZE) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const type = dv.getUint8(0);
+  const frameId = dv.getUint32(1);
+  const chunkIndex = dv.getUint16(5);
+  const totalChunks = dv.getUint16(7);
+  const payload = new Uint8Array(bytes.slice(HEADER_SIZE, bytes.length));
+  return { type, frameId, chunkIndex, totalChunks, payload };
+}
+
+/* ============================================================
+   QRコード描画（高速化: 1px/モジュールの小キャンバスに ImageData で
+   直接書き込み、表示用キャンバスへ drawImage で拡大blitする）
+   ============================================================ */
+const qrSmallCanvas = document.createElement('canvas');
+const qrSmallCtx = qrSmallCanvas.getContext('2d');
+const QUIET = 4; // 静寂領域(モジュール数)
+
+function renderQr(qr, targetCanvas){
+  const n = qr.getModuleCount();
+  const full = n + QUIET*2;
+  if (qrSmallCanvas.width !== full){
+    qrSmallCanvas.width = full;
+    qrSmallCanvas.height = full;
+  }
+  const img = qrSmallCtx.createImageData(full, full);
+  const data = img.data;
+  data.fill(255); // 白で初期化(アルファ含む255で全部埋まる)
+  for (let r=0;r<n;r++){
+    for (let c=0;c<n;c++){
+      if (qr.isDark(r,c)){
+        const px = c+QUIET, py = r+QUIET;
+        const idx = (py*full+px)*4;
+        data[idx]=0; data[idx+1]=0; data[idx+2]=0; data[idx+3]=255;
+      }
+    }
+  }
+  qrSmallCtx.putImageData(img, 0, 0);
+
+  const size = 640;
+  if (targetCanvas.width !== size) targetCanvas.width = size;
+  if (targetCanvas.height !== size) targetCanvas.height = size;
+  const ctx = targetCanvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(qrSmallCanvas, 0, 0, size, size);
+}
+
+/* ============================================================
+   デバイス列挙
+   ============================================================ */
+async function populateDevices(){
+  try{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d=>d.kind==='videoinput');
+    const mics = devices.filter(d=>d.kind==='audioinput');
+    [ $('tx-cam-device'), $('rx-cam-device') ].forEach(sel=>{
+      cams.forEach((d,i)=>{
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || ('カメラ '+(i+1));
+        sel.appendChild(opt);
+      });
+    });
+    mics.forEach((d,i)=>{
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || ('マイク '+(i+1));
+      $('tx-mic-device').appendChild(opt);
+    });
+  }catch(e){ /* 権限未許可の場合はラベル無しのままでも起動側selectでは既定値が使われる */ }
+}
+
+/* ============================================================
+   送信側 (TX)
+   ============================================================ */
+const TX = {
+  active:false,
+  stream:null,
+  camTrack:null,
+  compressCanvas: document.createElement('canvas'),
+  frameTimer:null,
+  audioTimer:null,
+  recorder:null,
+  frameSeq:0,
+  audioSeq:0,
+  outQueue:[],      // [{chunks:[Uint8Array..]}]
+  curFrame:null,
+  curIdx:0,
+  qrLoopHandle:null,
+  lastQrTime:0,
+  qrCount:0,
+  qrCountWindowStart:0,
+  bytesWindow:0,
+  bytesWindowStart:0,
+};
+
+function txSettings(){
+  return {
+    camRes: CAM_RES_PRESETS[$('tx-cam-res').value],
+    camFps: parseInt($('tx-cam-fps').value,10),
+    vidQ: TX_QUALITY_PRESETS[$('tx-vid-quality').value],
+    vidFps: parseInt($('tx-vid-fps').value,10),
+    audQ: AUDIO_QUALITY_PRESETS[$('tx-aud-quality').value],
+    audRate: parseInt($('tx-aud-rate').value,10),
+    ec: EC_LEVELS[$('tx-qr-ec').value].value,
+    ver: parseInt($('tx-qr-ver').value,10),
+    qrFps: parseInt($('tx-qr-fps').value,10),
+    useAudio: $('tx-use-audio').checked,
+  };
+}
+
+async function txStart(){
+  const s = txSettings();
+  try{
+    const constraints = {
+      video: {
+        deviceId: $('tx-cam-device').value ? {exact:$('tx-cam-device').value} : undefined,
+        width: { ideal: s.camRes.w },
+        height: { ideal: s.camRes.h },
+        frameRate: { ideal: s.camFps, max: s.camFps },
+      },
+      audio: s.useAudio ? {
+        deviceId: $('tx-mic-device').value ? {exact:$('tx-mic-device').value} : undefined,
+      } : false,
+    };
+    TX.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  }catch(e){
+    logTo('tx-log', 'カメラ/マイク取得エラー: '+e.message, 'err');
+    return;
+  }
+
+  $('tx-preview').srcObject = TX.stream;
+  TX.camTrack = TX.stream.getVideoTracks()[0];
+  TX.active = true;
+  TX.frameSeq = 0; TX.audioSeq = 0; TX.outQueue = []; TX.curFrame=null; TX.curIdx=0;
+  TX.qrCount=0; TX.qrCountWindowStart=nowMs(); TX.bytesWindow=0; TX.bytesWindowStart=nowMs();
+
+  $('tx-start').disabled = true;
+  $('tx-stop').disabled = false;
+  logTo('tx-log', '送信を開始しました', 'ok');
+
+  // 映像キャプチャループ
+  const scheduleFrame = ()=>{
+    if (!TX.active) return;
+    const cur = txSettings();
+    txCaptureAndCompress(cur);
+    TX.frameTimer = setTimeout(scheduleFrame, Math.max(1000/cur.vidFps, 10));
+  };
+  scheduleFrame();
+
+  // 音声
+  if (s.useAudio && TX.stream.getAudioTracks().length>0){
+    txStartAudio(s);
+  } else {
+    $('s-audio').textContent = s.useAudio ? '非対応/取得なし' : '無効';
+  }
+
+  // QR表示ループ (requestAnimationFrameで正確なタイミング制御)
+  let lastTs = nowMs();
+  const qrLoop = (ts)=>{
+    if (!TX.active) return;
+    const cur = txSettings();
+    const interval = 1000/cur.qrFps;
+    if (ts - lastTs >= interval){
+      lastTs = ts;
+      txAdvanceQr(cur);
+    }
+    TX.qrLoopHandle = requestAnimationFrame(qrLoop);
+  };
+  TX.qrLoopHandle = requestAnimationFrame(qrLoop);
+}
+
+function txCaptureAndCompress(s){
+  const video = $('tx-preview');
+  if (video.readyState < 2 || !video.videoWidth) return;
+  const cv = TX.compressCanvas;
+  cv.width = s.vidQ.w; cv.height = s.vidQ.h;
+  const ctx = cv.getContext('2d');
+  // アスペクト比を保ちつつcover
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.max(s.vidQ.w/vw, s.vidQ.h/vh);
+  const dw = vw*scale, dh = vh*scale;
+  ctx.drawImage(video, (s.vidQ.w-dw)/2, (s.vidQ.h-dh)/2, dw, dh);
+
+  cv.toBlob(async (blob)=>{
+    if (!blob || !TX.active) return;
+    const buf = await blob.arrayBuffer();
+    const raw = new Uint8Array(buf);
+    let compressed;
+    try{
+      compressed = pako.deflateRaw(raw, {level:6});
+    }catch(e){ compressed = raw; }
+    const frameId = (TX.frameSeq++) >>> 0;
+    const chunks = packetizeFrame(PKT_TYPE_VIDEO, frameId, compressed, s.ver, s.ec);
+    TX.outQueue.push({chunks, size:compressed.length});
+    // 遅延が溜まりすぎないよう、古いフレームを間引く
+    while (TX.outQueue.length > 2){
+      TX.outQueue.shift();
+      logTo('tx-log', '送出が追いつかないため古いフレームを破棄しました');
+    }
+    $('s-frame-id').textContent = String(frameId);
+  }, 'image/jpeg', s.vidQ.q);
+}
+
+function txStartAudio(s){
+  const mime = 'audio/webm;codecs=opus';
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported(mime)){
+    $('s-audio').textContent = '非対応(MediaRecorder)';
+    logTo('tx-log', 'このブラウザは音声エンコード(webm/opus)に対応していません', 'err');
+    return;
+  }
+  const timeslice = Math.max(1000/s.audRate, 50);
+  try{
+    TX.recorder = new MediaRecorder(TX.stream, { mimeType: mime, audioBitsPerSecond: s.audQ.bps });
+  }catch(e){
+    logTo('tx-log', '音声レコーダー初期化エラー: '+e.message, 'err');
+    return;
+  }
+  TX.recorder.ondataavailable = async (ev)=>{
+    if (!TX.active || !ev.data || ev.data.size===0) return;
+    const buf = await ev.data.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const curS = txSettings();
+    const audioId = (TX.audioSeq++) >>> 0;
+    const chunks = packetizeFrame(PKT_TYPE_AUDIO, audioId, bytes, curS.ver, curS.ec);
+    TX.outQueue.push({chunks, size:bytes.length, isAudio:true});
+    while (TX.outQueue.length > 3){ TX.outQueue.shift(); }
+  };
+  TX.recorder.start(timeslice);
+  $('s-audio').textContent = (s.audQ.bps/1000)+'kbps / '+timeslice.toFixed(0)+'ms';
+}
+
+function txAdvanceQr(s){
+  if (!TX.curFrame || TX.curIdx >= TX.curFrame.chunks.length){
+    if (TX.outQueue.length === 0) return; // 送るものがない
+    TX.curFrame = TX.outQueue.shift();
+    TX.curIdx = 0;
+  }
+  const pkt = TX.curFrame.chunks[TX.curIdx];
+  try{
+    const qr = qrcode(s.ver, s.ec);
+    qr.addData(bytesToBinaryString(pkt));
+    qr.make();
+    renderQr(qr, $('tx-qr-canvas'));
+  }catch(e){
+    logTo('tx-log', 'QR生成エラー（バージョン/EC設定を見直してください）: '+e.message, 'err');
+    TX.curFrame = null; TX.curIdx = 0;
+    return;
+  }
+  TX.curIdx++;
+  TX.bytesWindow += pkt.length;
+  TX.qrCount++;
+
+  const t = nowMs();
+  if (t - TX.qrCountWindowStart >= 500){
+    const fps = TX.qrCount / ((t-TX.qrCountWindowStart)/1000);
+    $('s-qr-fps').textContent = fps.toFixed(1)+' fps';
+    TX.qrCount = 0; TX.qrCountWindowStart = t;
+  }
+  if (t - TX.bytesWindowStart >= 500){
+    const bps = TX.bytesWindow / ((t-TX.bytesWindowStart)/1000);
+    $('s-bps').textContent = formatKBs(bps);
+    TX.bytesWindow = 0; TX.bytesWindowStart = t;
+  }
+  $('s-chunk').textContent = TX.curIdx+' / '+TX.curFrame.chunks.length;
+  $('s-queue').textContent = TX.outQueue.length+' フレーム';
+  $('s-progressbar').style.width = Math.round(100*TX.curIdx/TX.curFrame.chunks.length)+'%';
+}
+
+function txStop(){
+  TX.active = false;
+  if (TX.frameTimer) clearTimeout(TX.frameTimer);
+  if (TX.qrLoopHandle) cancelAnimationFrame(TX.qrLoopHandle);
+  if (TX.recorder && TX.recorder.state !== 'inactive') TX.recorder.stop();
+  if (TX.stream) TX.stream.getTracks().forEach(t=>t.stop());
+  $('tx-preview').srcObject = null;
+  $('tx-start').disabled = false;
+  $('tx-stop').disabled = true;
+  logTo('tx-log', '送信を停止しました');
+}
+
+function txUpdateCapacityReadout(){
+  const s = txSettings();
+  const cap = getQrCapacity(s.ver, s.ec);
+  $('tx-cap-v').textContent = cap;
+}
+
+/* ============================================================
+   受信側 (RX)
+   ============================================================ */
+const RX = {
+  active:false,
+  stream:null,
+  scanCanvas: document.createElement('canvas'),
+  rafHandle:null,
+  videoBuffers: new Map(), // frameId -> {total, chunks:Array, count}
+  lastShownVideoId: -1,
+  completedFrames:0,
+  qrCount:0, qrWindowStart:0,
+  bytesCount:0, bytesWindowStart:0,
+  lastImgUrl:null,
+  audioMediaSource:null,
+  audioSourceBuffer:null,
+  audioQueue:[],
+  audioChunkCount:0,
+};
+
+function rxSettings(){
+  return {
+    camRes: CAM_RES_PRESETS[$('rx-cam-res').value],
+    camFps: parseInt($('rx-cam-fps').value,10),
+  };
+}
+
+async function rxStart(){
+  const s = rxSettings();
+  try{
+    RX.stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: $('rx-cam-device').value ? {exact:$('rx-cam-device').value} : undefined,
+        width: { ideal: s.camRes.w },
+        height: { ideal: s.camRes.h },
+        frameRate: { ideal: s.camFps, max: s.camFps },
+      },
+      audio:false,
+    });
+  }catch(e){
+    logTo('rx-log', 'カメラ取得エラー: '+e.message, 'err');
+    return;
+  }
+  $('rx-scan-video').srcObject = RX.stream;
+  RX.active = true;
+  RX.videoBuffers.clear();
+  RX.audioBuffers = new Map();
+  RX.lastShownVideoId = -1;
+  RX.completedFrames = 0;
+  RX.qrCount=0; RX.qrWindowStart=nowMs();
+  RX.bytesCount=0; RX.bytesWindowStart=nowMs();
+  RX.audioChunkCount = 0;
+
+  $('rx-start').disabled = true;
+  $('rx-stop').disabled = false;
+  logTo('rx-log', '受信を開始しました', 'ok');
+
+  rxSetupAudioSink();
+
+  RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
+}
+
+function rxDecodeLoop(){
+  if (!RX.active) return;
+  const video = $('rx-scan-video');
+  if (video.readyState >= 2 && video.videoWidth){
+    const w = video.videoWidth, h = video.videoHeight;
+    const cv = RX.scanCanvas;
+    if (cv.width !== w) cv.width = w;
+    if (cv.height !== h) cv.height = h;
+    const ctx = cv.getContext('2d', { willReadFrequently:true });
+    ctx.drawImage(video, 0, 0, w, h);
+    const imgData = ctx.getImageData(0, 0, w, h);
+    let code = null;
+    try{
+      code = jsQR(imgData.data, w, h, { inversionAttempts:'dontInvert' });
+    }catch(e){ /* ignore single-frame decode failure */ }
+    if (code && code.binaryData && code.binaryData.length >= HEADER_SIZE){
+      rxHandlePacket(new Uint8Array(code.binaryData));
+      RX.qrCount++;
+    }
+  }
+  const t = nowMs();
+  if (t - RX.qrWindowStart >= 500){
+    $('r-qr-fps').textContent = (RX.qrCount/((t-RX.qrWindowStart)/1000)).toFixed(1)+' fps';
+    RX.qrCount = 0; RX.qrWindowStart = t;
+  }
+  if (t - RX.bytesWindowStart >= 500){
+    $('r-bps').textContent = formatKBs(RX.bytesCount/((t-RX.bytesWindowStart)/1000));
+    RX.bytesCount = 0; RX.bytesWindowStart = t;
+  }
+  RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
+}
+
+function rxHandlePacket(pktBytes){
+  const p = parsePacket(pktBytes);
+  if (!p) return;
+  RX.bytesCount += pktBytes.length;
+
+  if (p.type === PKT_TYPE_VIDEO){
+    rxAccumulate(RX.videoBuffers, p, (frameId, fullBytes)=>{
+      if (frameId <= RX.lastShownVideoId) return; // 古いフレームは無視(順序保証のため)
+      RX.lastShownVideoId = frameId;
+      let jpegBytes;
+      try{
+        jpegBytes = pako.inflateRaw(fullBytes);
+      }catch(e){
+        logTo('rx-log', 'フレーム'+frameId+' の展開に失敗しました', 'err');
+        return;
+      }
+      const blob = new Blob([jpegBytes], {type:'image/jpeg'});
+      const url = URL.createObjectURL(blob);
+      const img = $('rx-recon-img');
+      const prev = RX.lastImgUrl;
+      img.src = url;
+      RX.lastImgUrl = url;
+      if (prev) URL.revokeObjectURL(prev);
+      RX.completedFrames++;
+      $('r-frames').textContent = String(RX.completedFrames);
+    });
+  } else if (p.type === PKT_TYPE_AUDIO){
+    rxAccumulate(RX.audioBuffers || (RX.audioBuffers = new Map()), p, (audioId, fullBytes)=>{
+      RX.audioChunkCount++;
+      $('r-audio-chunks').textContent = String(RX.audioChunkCount);
+      rxFeedAudio(fullBytes);
+    });
+  }
+
+  // 進捗表示は最新の保留中フレームを代表として出す
+  const pending = RX.videoBuffers.get(p.frameId);
+  if (p.type===PKT_TYPE_VIDEO && pending){
+    $('r-progress').textContent = pending.count+' / '+pending.total;
+    $('r-progressbar').style.width = Math.round(100*pending.count/pending.total)+'%';
+  }
+  $('r-pending').textContent = String(RX.videoBuffers.size + (RX.audioBuffers?RX.audioBuffers.size:0));
+}
+
+function rxAccumulate(map, p, onComplete){
+  let entry = map.get(p.frameId);
+  if (!entry){
+    entry = { total: p.totalChunks, chunks: new Array(p.totalChunks), count: 0 };
+    map.set(p.frameId, entry);
+    // 保留中バッファのガベージコレクション（古いものを間引く）
+    if (map.size > 8){
+      let oldestKey = null;
+      for (const k of map.keys()){ oldestKey = k; break; }
+      map.delete(oldestKey);
+    }
+  }
+  if (!entry.chunks[p.chunkIndex]){
+    entry.chunks[p.chunkIndex] = p.payload;
+    entry.count++;
+  }
+  if (entry.count >= entry.total){
+    let total = 0;
+    for (let i=0;i<entry.chunks.length;i++) total += entry.chunks[i] ? entry.chunks[i].length : 0;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (let i=0;i<entry.chunks.length;i++){
+      const c = entry.chunks[i];
+      if (c){ out.set(c, off); off += c.length; }
+    }
+    map.delete(p.frameId);
+    onComplete(p.frameId, out);
+  }
+}
+
+function rxSetupAudioSink(){
+  const audioEl = $('rx-audio');
+  if (typeof MediaSource === 'undefined'){
+    $('rx-audio-hint').textContent = 'このブラウザは MediaSource に対応していないため音声再生はできません';
+    return;
+  }
+  const mime = 'audio/webm; codecs=opus';
+  if (!MediaSource.isTypeSupported(mime)){
+    $('rx-audio-hint').textContent = 'このブラウザは audio/webm;codecs=opus の再生に対応していません';
+    return;
+  }
+  const ms = new MediaSource();
+  RX.audioMediaSource = ms;
+  RX.audioSourceBuffer = null;
+  RX.audioQueue = [];
+  audioEl.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', ()=>{
+    try{
+      const sb = ms.addSourceBuffer(mime);
+      sb.mode = 'sequence';
+      RX.audioSourceBuffer = sb;
+      sb.addEventListener('updateend', ()=>{
+        if (RX.audioQueue.length && !sb.updating){
+          try{ sb.appendBuffer(RX.audioQueue.shift()); }catch(e){}
+        }
+      });
+      $('rx-audio-hint').textContent = '音声受信待機中…';
+      audioEl.play().catch(()=>{});
+    }catch(e){
+      $('rx-audio-hint').textContent = '音声バッファ初期化エラー: '+e.message;
+    }
+  });
+}
+
+function rxFeedAudio(bytes){
+  const sb = RX.audioSourceBuffer;
+  if (!sb){ return; }
+  const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset+bytes.byteLength);
+  if (sb.updating || RX.audioQueue.length){
+    RX.audioQueue.push(buf);
+  } else {
+    try{ sb.appendBuffer(buf); }catch(e){ logTo('rx-log','音声追加エラー: '+e.message); }
+  }
+  $('rx-audio-hint').textContent = '音声受信中';
+}
+
+function rxStop(){
+  RX.active = false;
+  if (RX.rafHandle) cancelAnimationFrame(RX.rafHandle);
+  if (RX.stream) RX.stream.getTracks().forEach(t=>t.stop());
+  $('rx-scan-video').srcObject = null;
+  $('rx-start').disabled = false;
+  $('rx-stop').disabled = true;
+  logTo('rx-log', '受信を停止しました');
+}
+
+/* ============================================================
+   初期化
+   ============================================================ */
+function initUI(){
+  fillSelect($('tx-cam-res'), CAM_RES_PRESETS);
+  fillSelect($('rx-cam-res'), CAM_RES_PRESETS);
+  fillSelect($('tx-vid-quality'), TX_QUALITY_PRESETS);
+  fillSelect($('tx-aud-quality'), AUDIO_QUALITY_PRESETS);
+  fillSelect($('tx-qr-ec'), EC_LEVELS);
+
+  // スライダーの数値表示を連動
+  const bind = (rangeId, outId, suffix)=>{
+    const r = $(rangeId), o = $(outId);
+    const upd = ()=>{ o.textContent = r.value; };
+    r.addEventListener('input', upd);
+    upd();
+  };
+  bind('tx-cam-fps','tx-cam-fps-v');
+  bind('tx-vid-fps','tx-vid-fps-v');
+  bind('tx-aud-rate','tx-aud-rate-v');
+  bind('tx-qr-ver','tx-qr-ver-v');
+  bind('tx-qr-fps','tx-qr-fps-v');
+  bind('rx-cam-fps','rx-cam-fps-v');
+
+  $('tx-qr-ver').addEventListener('input', txUpdateCapacityReadout);
+  $('tx-qr-ec').addEventListener('change', txUpdateCapacityReadout);
+  txUpdateCapacityReadout();
+
+  // タブ切替
+  $('tab-btn-tx').addEventListener('click', ()=>{
+    $('tab-btn-tx').classList.add('active','tx-active');
+    $('tab-btn-rx').classList.remove('active','rx-active');
+    $('view-tx').classList.add('active');
+    $('view-rx').classList.remove('active');
+  });
+  $('tab-btn-rx').addEventListener('click', ()=>{
+    $('tab-btn-rx').classList.add('active','rx-active');
+    $('tab-btn-tx').classList.remove('active','tx-active');
+    $('view-rx').classList.add('active');
+    $('view-tx').classList.remove('active');
+  });
+
+  $('tx-start').addEventListener('click', txStart);
+  $('tx-stop').addEventListener('click', txStop);
+  $('rx-start').addEventListener('click', rxStart);
+  $('rx-stop').addEventListener('click', rxStop);
+
+  populateDevices();
+  navigator.mediaDevices && navigator.mediaDevices.addEventListener &&
+    navigator.mediaDevices.addEventListener('devicechange', populateDevices);
+}
+
+document.addEventListener('DOMContentLoaded', initUI);
+</script>
+</body>
+</html>
