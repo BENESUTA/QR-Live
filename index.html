@@ -5,15 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Live-QR-streaming</title>
 
-<!-- ライブラリ選定について（decimen-optical-transfer と同系統の構成に変更）:
-     ・QRエンコード: node-qrcode (soldair/node-qrcode, npm "qrcode" のプリコンパイル済みブラウザ版 build/qrcode.js)
-       => decimen-optical-transfer が生成側に採用しているのと同じライブラリ。QRCode.create() は
-          mode:'byte' セグメントに Uint8Array 由来の配列をそのまま渡せるため、文字列変換(charCode変換)の
-          オーバーヘッドなしにバイナリを直接エンコードできる。バージョン(1-40)・誤り訂正レベルも直接指定可能。
+<!-- ライブラリ選定について（decimen-optical-transfer を参考にしつつ、実機検証で安全な組み合わせに調整）:
+     ・QRエンコード: qrcode-generator (kazuhikoarase)。当初は decimen-optical-transfer と同じ
+          node-qrcode(soldair)への切り替えを試みたが、公開されている precompiled ブラウザビルドは
+          mode:'byte' セグメントに配列/TypedArrayを渡しても内部で文字列として charCodeAt() を呼ぶ
+          実装になっており、生バイナリを安全に渡せないことが判明した(バージョンによりUTF-8的な
+          再エンコードも行われ、0x80以上のバイト値が壊れる)。qrcode-generator は addData() が
+          既定で 8bit Byte モード固定・charCodeAt(i)&0xff をそのまま1バイトとして書き込むだけの
+          実装で、UTF-8への再エンコードを一切行わないため、生バイナリの往復に安全で確実に動作する。
      ・QRデコード: zxing-wasm (Sec-ant/zxing-wasm)。decimen-optical-transfer の読み取り側
           (decimen-codec = 自前ビルドの zxing-cpp/WASM) と同じ zxing-cpp を WebAssembly化した公開パッケージ。
-          純JS実装のjsQRより大幅に高速・頑健なため、これに切り替えた。ReadResult.bytes が
-          生バイト列そのもの(文字コード変換なし)なので上記エンコーダと正しく対になる。
+          純JS実装のjsQRより大幅に高速・頑健で、実際のボトルネックだった「読み取り」側の高速化に直結する。
+          ReadResult.bytes が生バイト列そのもの(文字コード変換なし)なので上記エンコーダと正しく対になる。
           ファイルサイズは増える(wasmバイナリ約1MB)が、速度優先のため許容する。
      ・圧縮: 映像フレームはJPEG化した時点で既に十分圧縮されており、その上からdeflateを掛けても
           縮みがわずかな割にCPUコストが大きいため、パイプライン高速化のためdeflate/inflateの
@@ -40,11 +43,10 @@
     tryNext();
   }
   loadScriptWithFallback([
-    'https://unpkg.com/qrcode@1.5.0/build/qrcode.js',
-    'https://cdn.jsdelivr.net/npm/qrcode@1.5.0/build/qrcode.js',
-    'https://unpkg.com/qrcode@1.5.4/build/qrcode.js',
-    'https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.js'
-  ], function(){ return typeof window.QRCode !== 'undefined'; }, function(ok){
+    'https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js',
+    'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js',
+    'https://cdn.jsdelivr.net/npm/qrcode-generator/qrcode.js'
+  ], function(){ return typeof window.qrcode === 'function'; }, function(ok){
     window.__libStatus.qrcode = ok;
     if (window.reportLibStatus) reportLibStatus();
   });
@@ -456,17 +458,28 @@ function formatKBs(bytesPerSec){
   return (bytesPerSec/1024).toFixed(1)+' KB/s';
 }
 
+// Uint8Array(0-255) -> "生バイト文字列"（charCodeAt が 1バイトになるよう変換）
+function bytesToBinaryString(bytes){
+  let s = '';
+  const CHUNK = 0x2000;
+  for (let i=0;i<bytes.length;i+=CHUNK){
+    s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+CHUNK, bytes.length)));
+  }
+  return s;
+}
+
 /* ============================================================
    QRコード 1個あたりの最大バイト数を実測（バージョン×EC でキャッシュ）
-   node-qrcode は byteモードのセグメントに配列/Uint8ClampedArrayを直接渡せるため
-   文字列変換なしでそのまま実測できる。中身の値に依らず「長さ」だけで容量が決まる
-   ため、二分探索で実測する。
+   qrcode-generator は 8bit Byte 固定・生バイトそのまま書き込みのため
+   中身の値に依らず「長さ」だけで容量が決まる。二分探索で実測する。
    ============================================================ */
 const capacityCache = new Map();
 function probeFits(version, ec, byteLen){
   try{
-    const dummy = byteLen>0 ? new Array(byteLen).fill(0) : [];
-    QRCode.create([{ data: dummy, mode:'byte' }], { version: version, errorCorrectionLevel: ec });
+    const qr = qrcode(version, ec);
+    const dummy = byteLen>0 ? new Array(byteLen+1).join('\u0000') : '';
+    qr.addData(dummy);
+    qr.make();
     return true;
   }catch(e){
     return false;
@@ -530,8 +543,8 @@ const qrSmallCanvas = document.createElement('canvas');
 const qrSmallCtx = qrSmallCanvas.getContext('2d');
 const QUIET = 4; // 静寂領域(モジュール数)
 
-function renderQr(matrix, targetCanvas){
-  const n = matrix.size;
+function renderQr(qr, targetCanvas){
+  const n = qr.getModuleCount();
   const full = n + QUIET*2;
   if (qrSmallCanvas.width !== full){
     qrSmallCanvas.width = full;
@@ -542,7 +555,7 @@ function renderQr(matrix, targetCanvas){
   data.fill(255); // 白で初期化(アルファ含む255で全部埋まる)
   for (let r=0;r<n;r++){
     for (let c=0;c<n;c++){
-      if (matrix.get(r,c)){
+      if (qr.isDark(r,c)){
         const px = c+QUIET, py = r+QUIET;
         const idx = (py*full+px)*4;
         data[idx]=0; data[idx+1]=0; data[idx+2]=0; data[idx+3]=255;
@@ -626,7 +639,7 @@ function txSettings(){
 }
 
 async function txStart(){
-  if (typeof QRCode === 'undefined'){
+  if (typeof qrcode === 'undefined'){
     logTo('tx-log', 'QR生成ライブラリが読み込まれていないため開始できません。', 'err');
     return;
   }
@@ -756,8 +769,10 @@ function txAdvanceQr(s){
   }
   const pkt = TX.curFrame.chunks[TX.curIdx];
   try{
-    const created = QRCode.create([{ data: Array.from(pkt), mode:'byte' }], { version: s.ver, errorCorrectionLevel: s.ec });
-    renderQr(created.modules, $('tx-qr-canvas'));
+    const qr = qrcode(s.ver, s.ec);
+    qr.addData(bytesToBinaryString(pkt));
+    qr.make();
+    renderQr(qr, $('tx-qr-canvas'));
   }catch(e){
     logTo('tx-log', 'QR生成エラー（バージョン/EC設定を見直してください）: '+e.message, 'err');
     TX.curFrame = null; TX.curIdx = 0;
