@@ -332,6 +332,7 @@
           <div class="stat"><div class="k">実測QR速度</div><div class="v" id="s-qr-fps">0.0 fps</div></div>
           <div class="stat"><div class="k">送出キュー</div><div class="v" id="s-queue">0 フレーム</div></div>
           <div class="stat"><div class="k">推定送出速度</div><div class="v" id="s-bps">0 KB/s</div></div>
+          <div class="stat"><div class="k">QR生成時間(平均)</div><div class="v" id="s-gen-ms">- ms</div></div>
           <div class="stat"><div class="k">音声</div><div class="v" id="s-audio">-</div></div>
         </div>
         <div class="progresswrap"><div class="bar" id="s-progressbar"></div></div>
@@ -637,6 +638,7 @@ const TX = {
   qrCountWindowStart:0,
   bytesWindow:0,
   bytesWindowStart:0,
+  genMsEma:null,
 };
 
 // outQueueから指定した種類(kind)の「古いもの」だけを、その種類の件数が
@@ -700,7 +702,7 @@ async function txStart(){
   TX.active = true;
   TX.codecMode = s.codec;
   TX.frameSeq = 0; TX.audioSeq = 0; TX.vp8Seq = 0; TX.outQueue = []; TX.curFrame=null; TX.curIdx=0;
-  TX.qrCount=0; TX.qrCountWindowStart=nowMs(); TX.bytesWindow=0; TX.bytesWindowStart=nowMs();
+  TX.qrCount=0; TX.qrCountWindowStart=nowMs(); TX.bytesWindow=0; TX.bytesWindowStart=nowMs(); TX.genMsEma=null;
 
   $('tx-start').disabled = true;
   $('tx-stop').disabled = false;
@@ -708,11 +710,16 @@ async function txStart(){
   logTo('tx-log', '送信を開始しました（コーデック: '+(s.codec==='vp8'?'VP8':'JPEG')+')', 'ok');
 
   // 映像キャプチャループ（JPEGモードの圧縮・VP8モードのcanvas描画を兼ねる）
+  // VP8モードでは canvas.captureStream(fps) 側が指定fpsで自動的にcanvasを再サンプリングし、
+  // 描画が更新されていなければ直前のフレームをそのまま使い回してくれる(VP8はそれをほぼ無コストで
+  // 圧縮できる)。そのため本ループ自体はvidFpsより低い頻度(最大15fps)で回せば十分で、メインスレッドの
+  // drawImage負荷を減らせる。これにより同じスレッドで行うQR生成のスループットを確保しやすくなる。
   const scheduleFrame = ()=>{
     if (!TX.active) return;
     const cur = txSettings();
     if (cur.videoOn) txCaptureAndCompress(cur);
-    TX.frameTimer = setTimeout(scheduleFrame, Math.max(1000/cur.vidFps, 10));
+    const drawFps = (cur.codec === 'vp8') ? Math.min(cur.vidFps, 15) : cur.vidFps;
+    TX.frameTimer = setTimeout(scheduleFrame, Math.max(1000/drawFps, 10));
   };
   scheduleFrame();
 
@@ -854,7 +861,11 @@ function txSpawnVp8Recorder(s, sendReset){
       txRestartVp8();
     }
   };
-  const timeslice = 200; // ms 単位でチャンクを吐き出させる
+  // タイムスライスはビットレートに応じて可変にする。固定200msだと高ビットレート時に
+  // 1チャンクが大きくなり、packetizeFrame()の同期処理が一度に重くなってQR生成側の
+  // メインスレッド時間を奪ってしまう。1チャンクあたり約8KB程度を目安に調整する。
+  const targetChunkBytes = 8000;
+  const timeslice = Math.max(80, Math.min(300, Math.round(targetChunkBytes*8*1000/s.vidQ.vp8bps)));
   TX.vp8Recorder.start(timeslice);
   if (!s.videoOn) TX.vp8Recorder.pause();
 }
@@ -876,6 +887,7 @@ function txAdvanceQr(s){
     TX.curIdx = 0;
   }
   const pkt = TX.curFrame.chunks[TX.curIdx];
+  const genStart = nowMs();
   try{
     const qr = qrcode(s.ver, s.ec);
     qr.addData(bytesToBinaryString(pkt));
@@ -886,6 +898,9 @@ function txAdvanceQr(s){
     TX.curFrame = null; TX.curIdx = 0;
     return;
   }
+  const genMs = nowMs() - genStart;
+  TX.genMsEma = (TX.genMsEma===null) ? genMs : (TX.genMsEma*0.9 + genMs*0.1);
+  $('s-gen-ms').textContent = TX.genMsEma.toFixed(1)+' ms';
   TX.curIdx++;
   TX.bytesWindow += pkt.length;
   TX.qrCount++;
