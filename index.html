@@ -21,6 +21,11 @@
      ・圧縮: 映像フレームはJPEG化した時点で既に十分圧縮されており、その上からdeflateを掛けても
           縮みがわずかな割にCPUコストが大きいため、パイプライン高速化のためdeflate/inflateの
           往復を撤廃し、JPEGバイト列をそのままQRパケット化する。
+     ・映像コーデック: 既定のJPEGスナップショット方式に加え、canvas.captureStream()+MediaRecorder
+          によるVP8モードを選択可能にした。VP8はフレーム間予測を使う本物の動画コーデックのため、
+          同じ帯域でより高画質・高フレームレートを狙えるが、チャンクが前後に依存するため一部欠損で
+          破綻しうる。バックログが溜まった場合はキーフレームからストリームを自動的に再起動する。
+          受信側もMediaSourceで同じVP8ストリームをそのまま<video>要素に再生する。
 -->
 <script>
   // 単一のCDN/バージョン指定だと、ミラー側の欠落やキャッシュ不整合で
@@ -267,6 +272,13 @@
             <label for="tx-audio-enabled">音声を送信</label>
           </div>
         </div>
+        <label class="field"><span class="lbl">映像コーデック</span>
+          <select id="tx-codec-mode">
+            <option value="jpeg" selected>JPEGスナップショット（安定・自己完結）</option>
+            <option value="vp8">VP8（動画コーデック・高圧縮・実験的）</option>
+          </select>
+        </label>
+        <div class="hint" id="tx-codec-hint">JPEGは1フレームずつ独立して復元されるため、QRの取りこぼしに強い方式です。VP8は前後フレームの差分を使う本物の動画コーデックのため同じ帯域でより高画質・高フレームレートになりますが、取りこぼしが続くと映像が乱れ、自動的に再同期（一瞬フリーズ）します。</div>
         <label class="field"><span class="lbl">送信映像画質</span>
           <select id="tx-vid-quality"></select>
         </label>
@@ -364,7 +376,7 @@
           <div class="videobox"><span class="tag">読取カメラ</span><video id="rx-scan-video" autoplay muted playsinline></video></div>
         </div>
         <div>
-          <div class="videobox"><span class="tag">復元映像</span><img id="rx-recon-img" alt="受信待機中"></div>
+          <div class="videobox"><span class="tag">復元映像</span><img id="rx-recon-img" alt="受信待機中"><video id="rx-recon-video" muted playsinline style="display:none;"></video></div>
         </div>
       </div>
 
@@ -393,8 +405,10 @@
    共通定数 / プリセット
    ============================================================ */
 const HEADER_SIZE = 9; // type(1) + frameId(4) + chunkIndex(2) + totalChunks(2)
-const PKT_TYPE_VIDEO = 1;
-const PKT_TYPE_AUDIO = 2;
+const PKT_TYPE_VIDEO = 1;      // JPEGスナップショット(フレーム単独で復元可能)
+const PKT_TYPE_AUDIO = 2;      // 音声(webm/opus)チャンク
+const PKT_TYPE_VIDEO_VP8 = 3;  // VP8動画コーデックのチャンク(前チャンクに依存)
+const PKT_TYPE_VP8_RESET = 4;  // VP8ストリームの再同期マーカー(ペイロード無し)
 
 const CAM_RES_PRESETS = [
   { label:'176×144（QCIF・低負荷）', w:176,  h:144  },
@@ -405,10 +419,10 @@ const CAM_RES_PRESETS = [
 ];
 
 const TX_QUALITY_PRESETS = [
-  { label:'低画質（160×120 / Q0.40）', w:160, h:120, q:0.40 },
-  { label:'中画質（320×240 / Q0.50）', w:320, h:240, q:0.50, def:true },
-  { label:'高画質（480×360 / Q0.60）', w:480, h:360, q:0.60 },
-  { label:'最高画質（640×480 / Q0.75）',w:640, h:480, q:0.75 },
+  { label:'低画質（160×120 / Q0.40）', w:160, h:120, q:0.40, vp8bps:150000 },
+  { label:'中画質（320×240 / Q0.50）', w:320, h:240, q:0.50, vp8bps:400000, def:true },
+  { label:'高画質（480×360 / Q0.60）', w:480, h:360, q:0.60, vp8bps:800000 },
+  { label:'最高画質（640×480 / Q0.75）',w:640, h:480, q:0.75, vp8bps:1500000 },
 ];
 
 const AUDIO_QUALITY_PRESETS = [
@@ -608,9 +622,13 @@ const TX = {
   frameTimer:null,
   audioTimer:null,
   recorder:null,
+  codecMode:'jpeg',
+  vp8Recorder:null,
+  vp8Stream:null,
   frameSeq:0,
   audioSeq:0,
-  outQueue:[],      // [{chunks:[Uint8Array..]}]
+  vp8Seq:0,
+  outQueue:[],      // [{chunks:[Uint8Array..], kind:'jpeg'|'audio'|'vp8'}]
   curFrame:null,
   curIdx:0,
   qrLoopHandle:null,
@@ -621,10 +639,25 @@ const TX = {
   bytesWindowStart:0,
 };
 
+// outQueueから指定した種類(kind)の「古いもの」だけを、その種類の件数が
+// maxCountを超えないところまで間引く。他の種類の要素は一切触らないため、
+// 例えば音声の間引きがVP8チャンク(前後依存があり間引くと破綻する)を
+// 巻き添えにすることがない。
+function capQueueByKind(kind, maxCount){
+  const total = TX.outQueue.reduce((n,it)=> n + (it.kind===kind?1:0), 0);
+  let dropCount = total - maxCount;
+  if (dropCount <= 0) return;
+  TX.outQueue = TX.outQueue.filter((it)=>{
+    if (it.kind===kind && dropCount>0){ dropCount--; return false; }
+    return true;
+  });
+}
+
 function txSettings(){
   return {
     camRes: CAM_RES_PRESETS[$('tx-cam-res').value],
     camFps: parseInt($('tx-cam-fps').value,10),
+    codec: $('tx-codec-mode').value,
     vidQ: TX_QUALITY_PRESETS[$('tx-vid-quality').value],
     vidFps: parseInt($('tx-vid-fps').value,10),
     audQ: AUDIO_QUALITY_PRESETS[$('tx-aud-quality').value],
@@ -665,14 +698,16 @@ async function txStart(){
   $('tx-preview').srcObject = TX.stream;
   TX.camTrack = TX.stream.getVideoTracks()[0];
   TX.active = true;
-  TX.frameSeq = 0; TX.audioSeq = 0; TX.outQueue = []; TX.curFrame=null; TX.curIdx=0;
+  TX.codecMode = s.codec;
+  TX.frameSeq = 0; TX.audioSeq = 0; TX.vp8Seq = 0; TX.outQueue = []; TX.curFrame=null; TX.curIdx=0;
   TX.qrCount=0; TX.qrCountWindowStart=nowMs(); TX.bytesWindow=0; TX.bytesWindowStart=nowMs();
 
   $('tx-start').disabled = true;
   $('tx-stop').disabled = false;
-  logTo('tx-log', '送信を開始しました', 'ok');
+  $('tx-codec-mode').disabled = true; // ストリーム中のコーデック切替は不整合の元になるためロック
+  logTo('tx-log', '送信を開始しました（コーデック: '+(s.codec==='vp8'?'VP8':'JPEG')+')', 'ok');
 
-  // 映像キャプチャループ
+  // 映像キャプチャループ（JPEGモードの圧縮・VP8モードのcanvas描画を兼ねる）
   const scheduleFrame = ()=>{
     if (!TX.active) return;
     const cur = txSettings();
@@ -680,6 +715,10 @@ async function txStart(){
     TX.frameTimer = setTimeout(scheduleFrame, Math.max(1000/cur.vidFps, 10));
   };
   scheduleFrame();
+
+  if (s.codec === 'vp8'){
+    txStartVp8(s);
+  }
 
   // 音声
   if (s.useAudio && TX.stream.getAudioTracks().length>0){
@@ -715,18 +754,17 @@ function txCaptureAndCompress(s){
   const dw = vw*scale, dh = vh*scale;
   ctx.drawImage(video, (s.vidQ.w-dw)/2, (s.vidQ.h-dh)/2, dw, dh);
 
+  if (s.codec !== 'jpeg') return; // VP8モードはcanvasを描画するだけでよい(captureStreamが拾う)
+
   cv.toBlob(async (blob)=>{
     if (!blob || !TX.active) return;
     const buf = await blob.arrayBuffer();
     const raw = new Uint8Array(buf);
     const frameId = (TX.frameSeq++) >>> 0;
     const chunks = packetizeFrame(PKT_TYPE_VIDEO, frameId, raw, s.ver, s.ec);
-    TX.outQueue.push({chunks, size:raw.length});
-    // 遅延が溜まりすぎないよう、古いフレームを間引く
-    while (TX.outQueue.length > 2){
-      TX.outQueue.shift();
-      logTo('tx-log', '送出が追いつかないため古いフレームを破棄しました');
-    }
+    TX.outQueue.push({chunks, size:raw.length, kind:'jpeg'});
+    // 遅延が溜まりすぎないよう、JPEGフレームだけを対象に間引く
+    capQueueByKind('jpeg', 2);
     $('s-frame-id').textContent = String(frameId);
   }, 'image/jpeg', s.vidQ.q);
 }
@@ -753,12 +791,82 @@ function txStartAudio(s){
     const bytes = new Uint8Array(buf);
     const audioId = (TX.audioSeq++) >>> 0;
     const chunks = packetizeFrame(PKT_TYPE_AUDIO, audioId, bytes, curS.ver, curS.ec);
-    TX.outQueue.push({chunks, size:bytes.length, isAudio:true});
-    while (TX.outQueue.length > 3){ TX.outQueue.shift(); }
+    TX.outQueue.push({chunks, size:bytes.length, kind:'audio'});
+    // 音声だけを対象に間引く(VP8チャンクは前後依存があるため絶対に間引かない)
+    capQueueByKind('audio', 3);
   };
   TX.recorder.start(timeslice);
   if (!s.audioOn) TX.recorder.pause();
   $('s-audio').textContent = (s.audQ.bps/1000)+'kbps / '+timeslice.toFixed(0)+'ms'+(s.audioOn?'':' (ミュート)');
+}
+
+/* ============================================================
+   VP8コーデックモード
+   canvas.captureStream() でTX.compressCanvasの描画内容(=JPEGモードと同じ
+   解像度/画質プリセットで縮小済みの映像)をMediaStream化し、MediaRecorderで
+   VP8動画としてエンコードする。JPEGと違い各チャンクは前のチャンクに依存する
+   (フレーム間予測)ため、途中のチャンクを1つでも欠損すると以降が復元できなく
+   なる。そのためバックログが溜まりすぎた場合は個々のチャンクを間引くのではなく、
+   ストリーム自体を再起動(新しいキーフレーム+初期化セグメントから再送)する。
+   ============================================================ */
+function txStartVp8(s){
+  const mime = 'video/webm;codecs=vp8';
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported(mime)){
+    logTo('tx-log', 'このブラウザはVP8動画エンコード(MediaRecorder)に対応していません。JPEGモードをご利用ください。', 'err');
+    return;
+  }
+  const cv = TX.compressCanvas;
+  cv.width = s.vidQ.w; cv.height = s.vidQ.h; // captureStream前にサイズを確定させておく
+  try{
+    TX.vp8Stream = cv.captureStream(s.vidFps);
+  }catch(e){
+    logTo('tx-log', 'captureStreamに対応していません: '+e.message, 'err');
+    return;
+  }
+  txSpawnVp8Recorder(s, true);
+}
+
+function txSpawnVp8Recorder(s, sendReset){
+  const mime = 'video/webm;codecs=vp8';
+  try{
+    TX.vp8Recorder = new MediaRecorder(TX.vp8Stream, { mimeType: mime, videoBitsPerSecond: s.vidQ.vp8bps });
+  }catch(e){
+    logTo('tx-log', 'VP8レコーダー初期化エラー: '+e.message, 'err');
+    return;
+  }
+  TX.vp8Seq = 0;
+  if (sendReset){
+    // 受信側に「新しいVP8ストリーム(初期化セグメント)が始まる」ことを伝える
+    const resetPkt = buildPacket(PKT_TYPE_VP8_RESET, 0, 0, 1, new Uint8Array(0));
+    TX.outQueue.push({ chunks:[resetPkt], size:0, kind:'vp8' });
+  }
+  TX.vp8Recorder.ondataavailable = async (ev)=>{
+    if (!TX.active || TX.codecMode !== 'vp8' || !ev.data || ev.data.size===0) return;
+    const buf = await ev.data.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const curS = txSettings();
+    const chunkId = (TX.vp8Seq++) >>> 0;
+    const chunks = packetizeFrame(PKT_TYPE_VIDEO_VP8, chunkId, bytes, curS.ver, curS.ec);
+    TX.outQueue.push({chunks, size:bytes.length, kind:'vp8'});
+    const vp8Backlog = TX.outQueue.reduce((n,it)=> n+(it.kind==='vp8'?1:0), 0) + (TX.curFrame && TX.curFrame.kind==='vp8' ? 1 : 0);
+    if (vp8Backlog > 40){
+      logTo('tx-log', 'VP8バックログが大きいためストリームを再起動します（QR切替速度や画質設定の見直しを推奨）');
+      txRestartVp8();
+    }
+  };
+  const timeslice = 200; // ms 単位でチャンクを吐き出させる
+  TX.vp8Recorder.start(timeslice);
+  if (!s.videoOn) TX.vp8Recorder.pause();
+}
+
+function txRestartVp8(){
+  if (TX.vp8Recorder && TX.vp8Recorder.state !== 'inactive'){
+    try{ TX.vp8Recorder.stop(); }catch(e){}
+  }
+  // 送出待ちのVP8チャンクは全て破棄(古いストリームなので復元不能なため)
+  TX.outQueue = TX.outQueue.filter((it)=> it.kind !== 'vp8');
+  if (TX.curFrame && TX.curFrame.kind === 'vp8'){ TX.curFrame = null; TX.curIdx = 0; }
+  txSpawnVp8Recorder(txSettings(), true);
 }
 
 function txAdvanceQr(s){
@@ -803,10 +911,14 @@ function txStop(){
   if (TX.frameTimer) clearTimeout(TX.frameTimer);
   if (TX.qrLoopHandle) cancelAnimationFrame(TX.qrLoopHandle);
   if (TX.recorder && TX.recorder.state !== 'inactive') TX.recorder.stop();
+  if (TX.vp8Recorder && TX.vp8Recorder.state !== 'inactive') TX.vp8Recorder.stop();
+  if (TX.vp8Stream) TX.vp8Stream.getTracks().forEach(t=>t.stop());
+  TX.vp8Recorder = null; TX.vp8Stream = null;
   if (TX.stream) TX.stream.getTracks().forEach(t=>t.stop());
   $('tx-preview').srcObject = null;
   $('tx-start').disabled = false;
   $('tx-stop').disabled = true;
+  $('tx-codec-mode').disabled = false;
   logTo('tx-log', '送信を停止しました');
 }
 
@@ -826,7 +938,9 @@ const RX = {
   rafHandle:null,
   decoding:false,
   videoBuffers: new Map(), // frameId -> {total, chunks:Array, count}
+  videoVp8Buffers: new Map(),
   lastShownVideoId: -1,
+  videoMode: null, // 'jpeg' | 'vp8' (自動検出)
   completedFrames:0,
   qrCount:0, qrWindowStart:0,
   bytesCount:0, bytesWindowStart:0,
@@ -835,6 +949,10 @@ const RX = {
   audioSourceBuffer:null,
   audioQueue:[],
   audioChunkCount:0,
+  vp8MediaSource:null,
+  vp8SourceBuffer:null,
+  vp8Queue:[],
+  vp8ChunkCount:0,
 };
 
 const RX_READ_OPTS = { tryHarder:false, formats:['QRCode'], maxNumberOfSymbols:1 };
@@ -870,12 +988,17 @@ async function rxStart(){
   RX.active = true;
   RX.decoding = false;
   RX.videoBuffers.clear();
+  RX.videoVp8Buffers = new Map();
   RX.audioBuffers = new Map();
   RX.lastShownVideoId = -1;
+  RX.videoMode = null;
   RX.completedFrames = 0;
+  RX.vp8ChunkCount = 0;
   RX.qrCount=0; RX.qrWindowStart=nowMs();
   RX.bytesCount=0; RX.bytesWindowStart=nowMs();
   RX.audioChunkCount = 0;
+  $('rx-recon-img').style.display = '';
+  $('rx-recon-video').style.display = 'none';
 
   $('rx-start').disabled = true;
   $('rx-stop').disabled = false;
@@ -893,6 +1016,7 @@ async function rxStart(){
   }
 
   rxSetupAudioSink();
+  rxSetupVp8Sink();
 
   RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
 }
@@ -949,6 +1073,7 @@ function rxHandlePacket(pktBytes){
       if (prev) URL.revokeObjectURL(prev);
       RX.completedFrames++;
       $('r-frames').textContent = String(RX.completedFrames);
+      rxSetActiveVideoElement('jpeg');
     });
   } else if (p.type === PKT_TYPE_AUDIO){
     rxAccumulate(RX.audioBuffers || (RX.audioBuffers = new Map()), p, (audioId, fullBytes)=>{
@@ -956,15 +1081,24 @@ function rxHandlePacket(pktBytes){
       $('r-audio-chunks').textContent = String(RX.audioChunkCount);
       rxFeedAudio(fullBytes);
     });
+  } else if (p.type === PKT_TYPE_VP8_RESET){
+    rxResetVp8Sink();
+  } else if (p.type === PKT_TYPE_VIDEO_VP8){
+    rxAccumulate(RX.videoVp8Buffers, p, (chunkId, fullBytes)=>{
+      rxSetActiveVideoElement('vp8');
+      rxFeedVp8(fullBytes);
+      RX.vp8ChunkCount++;
+      $('r-frames').textContent = String(RX.vp8ChunkCount);
+    });
   }
 
   // 進捗表示は最新の保留中フレームを代表として出す
-  const pending = RX.videoBuffers.get(p.frameId);
-  if (p.type===PKT_TYPE_VIDEO && pending){
+  const pending = RX.videoBuffers.get(p.frameId) || RX.videoVp8Buffers.get(p.frameId);
+  if ((p.type===PKT_TYPE_VIDEO || p.type===PKT_TYPE_VIDEO_VP8) && pending){
     $('r-progress').textContent = pending.count+' / '+pending.total;
     $('r-progressbar').style.width = Math.round(100*pending.count/pending.total)+'%';
   }
-  $('r-pending').textContent = String(RX.videoBuffers.size + (RX.audioBuffers?RX.audioBuffers.size:0));
+  $('r-pending').textContent = String(RX.videoBuffers.size + RX.videoVp8Buffers.size + (RX.audioBuffers?RX.audioBuffers.size:0));
 }
 
 function rxAccumulate(map, p, onComplete){
@@ -1043,6 +1177,71 @@ function rxFeedAudio(bytes){
   $('rx-audio-hint').textContent = '音声受信中';
 }
 
+/* ============================================================
+   VP8コーデックモードの再生（MediaSourceでvideo要素にストリーミング）
+   ============================================================ */
+function rxSetActiveVideoElement(mode){
+  if (RX.videoMode === mode) return;
+  RX.videoMode = mode;
+  $('rx-recon-img').style.display = (mode==='jpeg') ? '' : 'none';
+  $('rx-recon-video').style.display = (mode==='vp8') ? '' : 'none';
+}
+
+function rxSetupVp8Sink(){
+  const videoEl = $('rx-recon-video');
+  if (typeof MediaSource === 'undefined'){
+    logTo('rx-log', 'このブラウザは MediaSource に対応していないためVP8映像は再生できません', 'err');
+    return;
+  }
+  const mime = 'video/webm; codecs="vp8"';
+  if (!MediaSource.isTypeSupported(mime)){
+    logTo('rx-log', 'このブラウザは video/webm;codecs=vp8 の再生に対応していません', 'err');
+    return;
+  }
+  const ms = new MediaSource();
+  RX.vp8MediaSource = ms;
+  RX.vp8SourceBuffer = null;
+  RX.vp8Queue = [];
+  videoEl.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', ()=>{
+    try{
+      const sb = ms.addSourceBuffer(mime);
+      sb.mode = 'sequence';
+      RX.vp8SourceBuffer = sb;
+      sb.addEventListener('updateend', ()=>{
+        if (RX.vp8Queue.length && !sb.updating){
+          try{ sb.appendBuffer(RX.vp8Queue.shift()); }catch(e){}
+        }
+      });
+    }catch(e){
+      logTo('rx-log', 'VP8バッファ初期化エラー: '+e.message, 'err');
+    }
+  });
+}
+
+function rxResetVp8Sink(){
+  // 送信側がストリームを再起動した合図。バッファと復元状態を作り直して再同期する。
+  logTo('rx-log', 'VP8ストリームを再同期しています…');
+  RX.videoVp8Buffers = new Map();
+  try{
+    if (RX.vp8MediaSource && RX.vp8MediaSource.readyState === 'open') RX.vp8MediaSource.endOfStream();
+  }catch(e){ /* ignore */ }
+  rxSetupVp8Sink();
+  const videoEl = $('rx-recon-video');
+  videoEl.play().catch(()=>{});
+}
+
+function rxFeedVp8(bytes){
+  const sb = RX.vp8SourceBuffer;
+  if (!sb){ return; }
+  const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset+bytes.byteLength);
+  if (sb.updating || RX.vp8Queue.length){
+    RX.vp8Queue.push(buf);
+  } else {
+    try{ sb.appendBuffer(buf); }catch(e){ logTo('rx-log', 'VP8追加エラー: '+e.message); }
+  }
+}
+
 function rxStop(){
   RX.active = false;
   if (RX.rafHandle) cancelAnimationFrame(RX.rafHandle);
@@ -1117,6 +1316,13 @@ function initUI(){
     $('view-tx').classList.remove('active');
   });
 
+  $('tx-video-enabled').addEventListener('change', ()=>{
+    const on = $('tx-video-enabled').checked;
+    if (TX.codecMode === 'vp8' && TX.vp8Recorder && TX.vp8Recorder.state !== 'inactive'){
+      if (on && TX.vp8Recorder.state === 'paused') TX.vp8Recorder.resume();
+      if (!on && TX.vp8Recorder.state === 'recording') TX.vp8Recorder.pause();
+    }
+  });
   $('tx-audio-enabled').addEventListener('change', ()=>{
     const on = $('tx-audio-enabled').checked;
     if (TX.recorder && TX.recorder.state !== 'inactive'){
