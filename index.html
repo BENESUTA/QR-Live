@@ -19,8 +19,45 @@
           縮みがわずかな割にCPUコストが大きいため、パイプライン高速化のためdeflate/inflateの
           往復を撤廃し、JPEGバイト列をそのままQRパケット化する。
 -->
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.1/dist/iife/reader/index.js"></script>
+<script>
+  // 単一のCDN/バージョン指定だと、ミラー側の欠落やキャッシュ不整合で
+  // スクリプトが404になっても<script>タグ自体はエラーを出さず、後段で
+  // 「変数が見つからない」という分かりにくいエラーになる。
+  // そのため複数のCDN/バージョンを順に試し、実際にグローバル変数が
+  // 定義されたことを確認できるまでフォールバックするローダーを用意する。
+  window.__libStatus = { qrcode: undefined, zxing: undefined };
+  function loadScriptWithFallback(urls, checkFn, onSettle){
+    var i = 0;
+    function tryNext(){
+      if (i >= urls.length){ onSettle(false); return; }
+      var url = urls[i++];
+      var s = document.createElement('script');
+      s.src = url;
+      s.onload = function(){ if (checkFn()) onSettle(true); else tryNext(); };
+      s.onerror = function(){ tryNext(); };
+      document.head.appendChild(s);
+    }
+    tryNext();
+  }
+  loadScriptWithFallback([
+    'https://unpkg.com/qrcode@1.5.0/build/qrcode.js',
+    'https://cdn.jsdelivr.net/npm/qrcode@1.5.0/build/qrcode.js',
+    'https://unpkg.com/qrcode@1.5.4/build/qrcode.js',
+    'https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.js'
+  ], function(){ return typeof window.QRCode !== 'undefined'; }, function(ok){
+    window.__libStatus.qrcode = ok;
+    if (window.reportLibStatus) reportLibStatus();
+  });
+  loadScriptWithFallback([
+    'https://unpkg.com/zxing-wasm@2.2.1/dist/iife/reader/index.js',
+    'https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.1/dist/iife/reader/index.js',
+    'https://unpkg.com/zxing-wasm@2.2.0/dist/iife/reader/index.js',
+    'https://cdn.jsdelivr.net/npm/zxing-wasm/dist/iife/reader/index.js'
+  ], function(){ return typeof window.ZXingWASM !== 'undefined'; }, function(ok){
+    window.__libStatus.zxing = ok;
+    if (window.reportLibStatus) reportLibStatus();
+  });
+</script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -217,7 +254,7 @@
       </div>
 
       <div class="card">
-        <h2><span class="bar"></span>送信（圧縮）設定</h2>
+        <h2><span class="bar"></span>送信設定</h2>
         <div class="row2" style="margin-bottom:12px;">
           <div class="checkline" style="margin-bottom:0;">
             <input type="checkbox" id="tx-video-enabled" checked>
@@ -258,7 +295,7 @@
       </div>
 
       <div class="btnrow">
-        <button class="action go tx" id="tx-start">送信開始</button>
+        <button class="action go tx" id="tx-start" disabled>送信開始</button>
         <button class="action stop" id="tx-stop" disabled>停止</button>
       </div>
     </div>
@@ -308,7 +345,7 @@
       </div>
 
       <div class="btnrow">
-        <button class="action go rx" id="rx-start">受信開始</button>
+        <button class="action go rx" id="rx-start" disabled>受信開始</button>
         <button class="action stop" id="rx-stop" disabled>停止</button>
       </div>
 
@@ -589,6 +626,10 @@ function txSettings(){
 }
 
 async function txStart(){
+  if (typeof QRCode === 'undefined'){
+    logTo('tx-log', 'QR生成ライブラリが読み込まれていないため開始できません。', 'err');
+    return;
+  }
   const s = txSettings();
   try{
     const constraints = {
@@ -791,6 +832,10 @@ function rxSettings(){
 }
 
 async function rxStart(){
+  if (typeof ZXingWASM === 'undefined'){
+    logTo('rx-log', 'QR読取ライブラリが読み込まれていないため開始できません。', 'err');
+    return;
+  }
   const s = rxSettings();
   try{
     RX.stream = await navigator.mediaDevices.getUserMedia({
@@ -880,14 +925,7 @@ function rxHandlePacket(pktBytes){
     rxAccumulate(RX.videoBuffers, p, (frameId, fullBytes)=>{
       if (frameId <= RX.lastShownVideoId) return; // 古いフレームは無視(順序保証のため)
       RX.lastShownVideoId = frameId;
-      let jpegBytes;
-      try{
-        jpegBytes = pako.inflateRaw(fullBytes);
-      }catch(e){
-        logTo('rx-log', 'フレーム'+frameId+' の展開に失敗しました', 'err');
-        return;
-      }
-      const blob = new Blob([jpegBytes], {type:'image/jpeg'});
+      const blob = new Blob([fullBytes], {type:'image/jpeg'});
       const url = URL.createObjectURL(blob);
       const img = $('rx-recon-img');
       const prev = RX.lastImgUrl;
@@ -1003,7 +1041,29 @@ function rxStop(){
 /* ============================================================
    初期化
    ============================================================ */
+/* ============================================================
+   ライブラリ読み込み状況の反映
+   ============================================================ */
+function reportLibStatus(){
+  if (!document.getElementById('tx-log')) return; // DOM未構築ならinitUI側で後から再評価
+  if (window.__libStatus.qrcode === true){
+    if (!TX.active) $('tx-start').disabled = false;
+  } else if (window.__libStatus.qrcode === false){
+    $('tx-start').disabled = true;
+    logTo('tx-log', 'QR生成ライブラリ(qrcode)の読み込みに失敗しました。ネットワーク接続やCDNブロックをご確認のうえ再読み込みしてください。', 'err');
+  }
+  if (window.__libStatus.zxing === true){
+    if (!RX.active) $('rx-start').disabled = false;
+  } else if (window.__libStatus.zxing === false){
+    $('rx-start').disabled = true;
+    logTo('rx-log', 'QR読取ライブラリ(zxing-wasm)の読み込みに失敗しました。ネットワーク接続やCDNブロックをご確認のうえ再読み込みしてください。', 'err');
+  }
+}
+window.reportLibStatus = reportLibStatus;
+
 function initUI(){
+  logTo('tx-log', 'ライブラリを読み込み中…');
+  logTo('rx-log', 'ライブラリを読み込み中…');
   fillSelect($('tx-cam-res'), CAM_RES_PRESETS);
   fillSelect($('rx-cam-res'), CAM_RES_PRESETS);
   fillSelect($('tx-vid-quality'), TX_QUALITY_PRESETS);
@@ -1065,6 +1125,8 @@ function initUI(){
   populateDevices();
   navigator.mediaDevices && navigator.mediaDevices.addEventListener &&
     navigator.mediaDevices.addEventListener('devicechange', populateDevices);
+
+  reportLibStatus();
 }
 
 document.addEventListener('DOMContentLoaded', initUI);
