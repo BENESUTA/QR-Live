@@ -204,6 +204,13 @@
   .progresswrap .bar{ height:100%; width:0%; background:var(--tx); transition:width .08s linear; }
   .rx-scope .progresswrap .bar{ background:var(--rx); }
 
+  .meterrow{ display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  .meterrow .lbl{ font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--ink-dim); white-space:nowrap; }
+  .meter{ flex:1; height:12px; background:var(--panel-2); border:1px solid var(--line); border-radius:4px; overflow:hidden; }
+  .meter .meter-bar{ height:100%; width:0%; background:var(--tx); transition:width .05s linear; }
+  .rx-scope .meter .meter-bar{ background:var(--rx); }
+  .devcard h2{ color: var(--good); }
+
   .loglist{
     margin-top:10px; height:120px; overflow-y:auto; font-family:'JetBrains Mono',monospace; font-size:11.5px;
     background:#0b1015; border:1px solid var(--line); border-radius:var(--radius); padding:8px;
@@ -338,6 +345,20 @@
         <div class="progresswrap"><div class="bar" id="s-progressbar"></div></div>
         <div class="loglist" id="tx-log"></div>
       </div>
+
+      <div class="card devcard">
+        <h2><span class="bar"></span>開発者機能：音声送信確認</h2>
+        <div class="meterrow">
+          <span class="lbl">マイク入力レベル</span>
+          <div class="meter"><div class="meter-bar" id="tx-audio-meter-bar"></div></div>
+        </div>
+        <div class="statline">
+          <div class="stat"><div class="k">送信音声チャンク数</div><div class="v" id="dev-tx-audio-count">0</div></div>
+          <div class="stat"><div class="k">直近チャンクサイズ</div><div class="v" id="dev-tx-audio-lastsize">-</div></div>
+          <div class="stat"><div class="k">直近送信時刻</div><div class="v" id="dev-tx-audio-lasttime">-</div></div>
+        </div>
+        <div class="hint">レベルメーターが振れていればマイクから音が拾えています。「音声チャンク数」が増えていればエンコード〜送出キューまで到達しています（QRとして実際に受信側へ届いたかは受信側の開発者機能で確認してください）。</div>
+      </div>
     </div>
   </section>
 
@@ -393,6 +414,21 @@
         </div>
         <div class="progresswrap"><div class="bar" id="r-progressbar"></div></div>
         <div class="loglist" id="rx-log"></div>
+      </div>
+
+      <div class="card devcard">
+        <h2><span class="bar"></span>開発者機能：音声受信確認</h2>
+        <div class="meterrow">
+          <span class="lbl">再生音声レベル</span>
+          <div class="meter"><div class="meter-bar" id="rx-audio-meter-bar"></div></div>
+        </div>
+        <div class="statline">
+          <div class="stat"><div class="k">受信音声チャンク数</div><div class="v" id="r-audio-chunks-dev">0</div></div>
+          <div class="stat"><div class="k">再生位置</div><div class="v" id="dev-rx-audio-currenttime">-</div></div>
+          <div class="stat"><div class="k">バッファ範囲</div><div class="v" id="dev-rx-audio-buffered">-</div></div>
+          <div class="stat"><div class="k">再生状態</div><div class="v" id="dev-rx-audio-state">-</div></div>
+        </div>
+        <div class="hint">レベルメーターが振れていれば、QR受信〜opusデコード〜実際のスピーカー出力まで通しで機能しています。チャンク数だけ増えてレベルが振れない場合は、パケットは届いているがMediaSourceでの再生に失敗している可能性があります（上のログをご確認ください）。</div>
       </div>
     </div>
   </section>
@@ -639,6 +675,11 @@ const TX = {
   bytesWindow:0,
   bytesWindowStart:0,
   genMsEma:null,
+  audioCtx:null,
+  audioAnalyser:null,
+  audioMeterHandle:null,
+  audioMeterBuf:null,
+  devAudioChunkCount:0,
 };
 
 // outQueueから指定した種類(kind)の「古いもの」だけを、その種類の件数が
@@ -728,8 +769,13 @@ async function txStart(){
   }
 
   // 音声
+  TX.devAudioChunkCount = 0;
+  $('dev-tx-audio-count').textContent = '0';
+  $('dev-tx-audio-lastsize').textContent = '-';
+  $('dev-tx-audio-lasttime').textContent = '-';
   if (s.useAudio && TX.stream.getAudioTracks().length>0){
     try{ txStartAudio(s); }catch(e){ logTo('tx-log', '音声初期化で例外が発生しました: '+e.message, 'err'); }
+    try{ txStartAudioMeter(TX.stream); }catch(e){ logTo('tx-log', 'レベルメーター初期化で例外: '+e.message, 'err'); }
   } else {
     $('s-audio').textContent = s.useAudio ? '非対応/取得なし' : '無効';
   }
@@ -801,10 +847,46 @@ function txStartAudio(s){
     TX.outQueue.push({chunks, size:bytes.length, kind:'audio'});
     // 音声だけを対象に間引く(VP8チャンクは前後依存があるため絶対に間引かない)
     capQueueByKind('audio', 3);
+    // 開発者機能: 送信音声チャンクの統計を更新
+    TX.devAudioChunkCount++;
+    $('dev-tx-audio-count').textContent = String(TX.devAudioChunkCount);
+    $('dev-tx-audio-lastsize').textContent = bytes.length+' B';
+    $('dev-tx-audio-lasttime').textContent = new Date().toLocaleTimeString('ja-JP');
   };
   TX.recorder.start(timeslice);
   if (!s.audioOn) TX.recorder.pause();
   $('s-audio').textContent = (s.audQ.bps/1000)+'kbps / '+timeslice.toFixed(0)+'ms'+(s.audioOn?'':' (ミュート)');
+}
+
+/* ============================================================
+   開発者機能: マイク入力レベルメーター
+   AnalyserNodeで実際にマイクへ音が入っているかを可視化する。
+   destinationには繋がない(自分のスピーカーへの回り込み/ハウリングを防ぐため)。
+   ============================================================ */
+function txStartAudioMeter(stream){
+  try{
+    TX.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    TX.audioCtx.resume().catch(()=>{});
+    const src = TX.audioCtx.createMediaStreamSource(stream);
+    const analyser = TX.audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    TX.audioAnalyser = analyser;
+    TX.audioMeterBuf = new Uint8Array(analyser.fftSize);
+    txAudioMeterTick();
+  }catch(e){
+    logTo('tx-log', '音声レベルメーター初期化エラー: '+e.message, 'err');
+  }
+}
+function txAudioMeterTick(){
+  if (!TX.active || !TX.audioAnalyser) return;
+  TX.audioAnalyser.getByteTimeDomainData(TX.audioMeterBuf);
+  let sumSq = 0;
+  for (let i=0;i<TX.audioMeterBuf.length;i++){ const v=(TX.audioMeterBuf[i]-128)/128; sumSq += v*v; }
+  const rms = Math.sqrt(sumSq/TX.audioMeterBuf.length);
+  const pct = Math.min(100, Math.round(rms*100*3)); // 見やすいよう軽く増幅
+  $('tx-audio-meter-bar').style.width = pct+'%';
+  TX.audioMeterHandle = requestAnimationFrame(txAudioMeterTick);
 }
 
 /* ============================================================
@@ -925,6 +1007,10 @@ function txStop(){
   TX.active = false;
   if (TX.frameTimer) clearTimeout(TX.frameTimer);
   if (TX.qrLoopHandle) cancelAnimationFrame(TX.qrLoopHandle);
+  if (TX.audioMeterHandle) cancelAnimationFrame(TX.audioMeterHandle);
+  TX.audioAnalyser = null;
+  if (TX.audioCtx) { TX.audioCtx.close().catch(()=>{}); TX.audioCtx = null; }
+  $('tx-audio-meter-bar').style.width = '0%';
   if (TX.recorder && TX.recorder.state !== 'inactive') TX.recorder.stop();
   if (TX.vp8Recorder && TX.vp8Recorder.state !== 'inactive') TX.vp8Recorder.stop();
   if (TX.vp8Stream) TX.vp8Stream.getTracks().forEach(t=>t.stop());
@@ -968,6 +1054,10 @@ const RX = {
   vp8SourceBuffer:null,
   vp8Queue:[],
   vp8ChunkCount:0,
+  audioCtxOut:null,
+  audioOutAnalyser:null,
+  audioMeterHandle:null,
+  audioMeterBuf:null,
 };
 
 const RX_READ_OPTS = { tryHarder:false, formats:['QRCode'], maxNumberOfSymbols:1 };
@@ -1012,6 +1102,11 @@ async function rxStart(){
   RX.qrCount=0; RX.qrWindowStart=nowMs();
   RX.bytesCount=0; RX.bytesWindowStart=nowMs();
   RX.audioChunkCount = 0;
+  $('r-audio-chunks-dev').textContent = '0';
+  $('dev-rx-audio-currenttime').textContent = '-';
+  $('dev-rx-audio-buffered').textContent = '-';
+  $('dev-rx-audio-state').textContent = '-';
+  $('rx-audio-meter-bar').style.width = '0%';
   $('rx-recon-img').style.display = '';
   $('rx-recon-video').style.display = 'none';
 
@@ -1032,6 +1127,7 @@ async function rxStart(){
 
   try{ rxSetupAudioSink(); }catch(e){ logTo('rx-log', '音声シンク初期化で例外: '+e.message, 'err'); }
   try{ rxSetupVp8Sink(); }catch(e){ logTo('rx-log', 'VP8シンク初期化で例外: '+e.message, 'err'); }
+  try{ rxStartAudioMeter(); }catch(e){ logTo('rx-log', 'レベルメーター初期化で例外: '+e.message, 'err'); }
 
   RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
 }
@@ -1094,6 +1190,7 @@ function rxHandlePacket(pktBytes){
     rxAccumulate(RX.audioBuffers || (RX.audioBuffers = new Map()), p, (audioId, fullBytes)=>{
       RX.audioChunkCount++;
       $('r-audio-chunks').textContent = String(RX.audioChunkCount);
+      $('r-audio-chunks-dev').textContent = String(RX.audioChunkCount);
       rxFeedAudio(fullBytes);
     });
   } else if (p.type === PKT_TYPE_VP8_RESET){
@@ -1193,6 +1290,55 @@ function rxFeedAudio(bytes){
 }
 
 /* ============================================================
+   開発者機能: 受信側 再生音声レベルメーター
+   <audio>要素の実際の出力音声をAnalyserNodeで可視化する。パケットが届いている
+   だけでなく、opusデコード〜MediaSource再生まで通しで機能しているかを確認できる。
+   createMediaElementSourceは同じ<audio>要素に対して生涯1回しか呼べないため、
+   一度作ったノードは使い回し、rxStop()ではRAFループだけ止めてrxStart()側で
+   再開する。
+   ============================================================ */
+function rxStartAudioMeter(){
+  if (RX.audioOutAnalyser){
+    rxAudioMeterTick();
+    return;
+  }
+  try{
+    const audioEl = $('rx-audio');
+    RX.audioCtxOut = new (window.AudioContext || window.webkitAudioContext)();
+    RX.audioCtxOut.resume().catch(()=>{});
+    const src = RX.audioCtxOut.createMediaElementSource(audioEl);
+    const analyser = RX.audioCtxOut.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    analyser.connect(RX.audioCtxOut.destination); // 必須: 繋がないと音が出なくなる
+    RX.audioOutAnalyser = analyser;
+    RX.audioMeterBuf = new Uint8Array(analyser.fftSize);
+    rxAudioMeterTick();
+  }catch(e){
+    logTo('rx-log', '音声レベルメーター初期化エラー: '+e.message, 'err');
+  }
+}
+function rxAudioMeterTick(){
+  if (!RX.active || !RX.audioOutAnalyser) return;
+  RX.audioOutAnalyser.getByteTimeDomainData(RX.audioMeterBuf);
+  let sumSq = 0;
+  for (let i=0;i<RX.audioMeterBuf.length;i++){ const v=(RX.audioMeterBuf[i]-128)/128; sumSq += v*v; }
+  const rms = Math.sqrt(sumSq/RX.audioMeterBuf.length);
+  const pct = Math.min(100, Math.round(rms*100*3));
+  $('rx-audio-meter-bar').style.width = pct+'%';
+  const audioEl = $('rx-audio');
+  $('dev-rx-audio-currenttime').textContent = audioEl.currentTime.toFixed(2)+'s';
+  let bufStr = '-';
+  try{
+    const b = audioEl.buffered;
+    if (b.length>0){ bufStr = b.start(0).toFixed(2)+'–'+b.end(b.length-1).toFixed(2)+'s'; }
+  }catch(e){ /* ignore */ }
+  $('dev-rx-audio-buffered').textContent = bufStr;
+  $('dev-rx-audio-state').textContent = (audioEl.paused?'一時停止':'再生中')+' / readyState='+audioEl.readyState;
+  RX.audioMeterHandle = requestAnimationFrame(rxAudioMeterTick);
+}
+
+/* ============================================================
    VP8コーデックモードの再生（MediaSourceでvideo要素にストリーミング）
    ============================================================ */
 function rxSetActiveVideoElement(mode){
@@ -1260,6 +1406,8 @@ function rxFeedVp8(bytes){
 function rxStop(){
   RX.active = false;
   if (RX.rafHandle) cancelAnimationFrame(RX.rafHandle);
+  if (RX.audioMeterHandle) cancelAnimationFrame(RX.audioMeterHandle);
+  $('rx-audio-meter-bar').style.width = '0%';
   if (RX.stream) RX.stream.getTracks().forEach(t=>t.stop());
   $('rx-scan-video').srcObject = null;
   $('rx-start').disabled = false;
