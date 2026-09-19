@@ -724,12 +724,12 @@ async function txStart(){
   scheduleFrame();
 
   if (s.codec === 'vp8'){
-    txStartVp8(s);
+    try{ txStartVp8(s); }catch(e){ logTo('tx-log', 'VP8初期化で例外が発生しました: '+e.message+'（JPEGモードをお試しください）', 'err'); }
   }
 
   // 音声
   if (s.useAudio && TX.stream.getAudioTracks().length>0){
-    txStartAudio(s);
+    try{ txStartAudio(s); }catch(e){ logTo('tx-log', '音声初期化で例外が発生しました: '+e.message, 'err'); }
   } else {
     $('s-audio').textContent = s.useAudio ? '非対応/取得なし' : '無効';
   }
@@ -1030,8 +1030,8 @@ async function rxStart(){
     logTo('rx-log', 'zxing-wasm が読み込まれていません(CDNブロック等)。受信できません。', 'err');
   }
 
-  rxSetupAudioSink();
-  rxSetupVp8Sink();
+  try{ rxSetupAudioSink(); }catch(e){ logTo('rx-log', '音声シンク初期化で例外: '+e.message, 'err'); }
+  try{ rxSetupVp8Sink(); }catch(e){ logTo('rx-log', 'VP8シンク初期化で例外: '+e.message, 'err'); }
 
   RX.rafHandle = requestAnimationFrame(rxDecodeLoop);
 }
@@ -1290,6 +1290,23 @@ function reportLibStatus(){
 }
 window.reportLibStatus = reportLibStatus;
 
+function checkVp8Support(){
+  const encodeOk = !!(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp8'));
+  const decodeOk = !!(window.MediaSource && MediaSource.isTypeSupported && MediaSource.isTypeSupported('video/webm; codecs="vp8"'));
+  const opt = $('tx-codec-mode').querySelector('option[value="vp8"]');
+  if (!encodeOk){
+    opt.disabled = true;
+    opt.textContent = 'VP8（このブラウザでは非対応・録画エンコード不可）';
+    logTo('tx-log', 'このブラウザはVP8動画エンコード(MediaRecorder)に対応していません。映像コーデックはJPEGスナップショットのみ選択できます。', 'err');
+  } else if (!decodeOk){
+    // 送信は出来ても、この端末を受信側として使う場合はVP8を再生できない
+    logTo('tx-log', 'このブラウザはVP8動画の再生(MediaSource)には対応していません。送信は可能ですが、この端末を受信側にする場合はJPEGモードをご利用ください。', 'err');
+  }
+  if (!decodeOk){
+    logTo('rx-log', 'このブラウザはVP8動画の再生(MediaSource)に対応していないため、送信側がVP8モードの場合は映像が表示されません。送信側にJPEGモードを使うよう伝えてください。', 'err');
+  }
+}
+
 function initUI(){
   logTo('tx-log', 'ライブラリを読み込み中…');
   logTo('rx-log', 'ライブラリを読み込み中…');
@@ -1298,6 +1315,7 @@ function initUI(){
   fillSelect($('tx-vid-quality'), TX_QUALITY_PRESETS);
   fillSelect($('tx-aud-quality'), AUDIO_QUALITY_PRESETS);
   fillSelect($('tx-qr-ec'), EC_LEVELS);
+  checkVp8Support();
 
   // スライダーの数値表示を連動
   const bind = (rangeId, outId, suffix)=>{
